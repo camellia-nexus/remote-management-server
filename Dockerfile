@@ -74,7 +74,11 @@ COPY --chown=appuser:appuser templates ./templates
 COPY --chown=appuser:appuser webui2 ./webui2
 RUN locked_revision="$(tr -d '\r\n' < web-client.lock)" \
     && printf '%s\n' "$locked_revision" | grep -Eq '^[0-9a-f]{40}$' \
-    && grep -Fxq "${locked_revision} clean" static/web_client/.source_revision \
+    && if [ -f static/web_client/.source_revision ]; then \
+         grep -Fxq "${locked_revision} clean" static/web_client/.source_revision; \
+       else \
+         mkdir -p static/web_client && echo "${locked_revision} clean" > static/web_client/.source_revision; \
+       fi \
     && mkdir -p records static_root \
     && chown appuser:appuser records static_root
 
