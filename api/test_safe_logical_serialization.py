@@ -49,6 +49,7 @@ class SafeLogicalSerializationTests(TestCase):
             self.encrypted_model_labels(),
             {
                 "api.AddressBookProfile",
+                "api.ManagementBatchOperation",
                 "api.OidcPendingAuth",
                 "api.RecordingUpload",
                 "api.RemoteDevice",
