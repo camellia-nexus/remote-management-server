@@ -65,6 +65,7 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"
+testpaths = ["api", "webui2"]
 python_files = ["tests.py", "test_*.py", "*_tests.py"]
 addopts = "--strict-markers --reuse-db"
 
