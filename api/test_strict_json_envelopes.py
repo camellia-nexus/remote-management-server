@@ -240,7 +240,7 @@ class StrictJsonEnvelopeHttpTests(TestCase):
     @override_settings(JSON_CONTROL_MAX_BODY_BYTES=4096, JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES=2 * 1024 * 1024)
     def test_address_book_bulk_route_does_not_inherit_control_budget(self):
         profile = _ensure_personal_profile(self.admin)
-        values = ["x" * 1000] * 1000
+        values = [f"peer-{i:010d}" for i in range(1000)]
 
         response = self.client.delete(
             f"/api/ab/peer/{profile.guid}",

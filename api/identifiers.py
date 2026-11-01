@@ -1,6 +1,12 @@
+import re
 import uuid
 
 from django.core.exceptions import ValidationError
+
+REMOTE_ID_MIN_LENGTH = 6
+REMOTE_ID_MAX_LENGTH = 16
+_REMOTE_ID_PATTERN = re.compile(r"^[0-9A-Za-z_-]{6,16}\Z")
+_PROFILE_GUID_PATTERN = re.compile(r"^[0-9A-Za-z_-]{1,60}\Z")
 
 _AUTO_FIELD_MAX = {
     "SmallAutoField": (1 << 15) - 1,
@@ -81,3 +87,29 @@ def parse_model_pk_list(value, model, *, max_items):
 
 def parse_uuid_list(value, *, max_items):
     return _parse_list(value, parse_uuid, max_items=max_items)
+
+
+def parse_remote_id(value):
+    """Parse one canonical Remote/Peer ID (6–16 ASCII alphanumeric, hyphen, underscore)."""
+    if not isinstance(value, str) or not value.isascii():
+        raise InvalidIdentifier("A remote ID must be ASCII text")
+    if not _REMOTE_ID_PATTERN.fullmatch(value):
+        raise InvalidIdentifier("Remote ID must be 6-16 characters matching [0-9A-Za-z_-]")
+    return value
+
+
+def parse_remote_id_list(value, *, max_items):
+    """Parse a bounded list of unique Remote/Peer IDs."""
+    return _parse_list(value, parse_remote_id, max_items=max_items)
+
+
+def parse_profile_guid(value):
+    """Parse an AddressBookProfile GUID (bounded ASCII alphanumeric, hyphen, underscore)."""
+    if not isinstance(value, str) or not value.isascii() or not (1 <= len(value) <= 60):
+        raise InvalidIdentifier("An address-book profile GUID must be bounded ASCII text")
+    if not _PROFILE_GUID_PATTERN.fullmatch(value):
+        raise InvalidIdentifier("Invalid address-book profile GUID")
+    if len(value) == 32 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return value.lower()
+    return value
+

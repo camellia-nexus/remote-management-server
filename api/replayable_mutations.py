@@ -4,6 +4,7 @@ import json
 import re
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -58,18 +59,24 @@ def _profile_references(operation, request, route_kwargs, body):
             if reference:
                 profile_guids.add(str(reference))
         elif reference:
-            share_profile = AddressBookShare.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
-            rule_profile = None
-            if share_profile is None:
-                rule_profile = (
-                    AddressBookRule.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
-                )
-            if share_profile is not None or rule_profile is not None:
-                profile_pks.add(share_profile if share_profile is not None else rule_profile)
+            try:
+                share_profile = AddressBookShare.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
+                rule_profile = None
+                if share_profile is None:
+                    rule_profile = (
+                        AddressBookRule.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
+                    )
+                if share_profile is not None or rule_profile is not None:
+                    profile_pks.add(share_profile if share_profile is not None else rule_profile)
+            except (ValidationError, ValueError):
+                pass
     elif operation == "address_book_rule_delete" and isinstance(body, list):
-        references = [str(value) for value in body]
-        profile_pks.update(AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True))
-        profile_pks.update(AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True))
+        try:
+            references = [str(value) for value in body]
+            profile_pks.update(AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True))
+            profile_pks.update(AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True))
+        except (ValidationError, ValueError):
+            pass
     return profile_guids, profile_pks
 
 
