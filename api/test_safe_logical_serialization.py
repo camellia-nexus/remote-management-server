@@ -30,7 +30,7 @@ class SafeLogicalSerializationTests(TestCase):
         )
         self.peer = RemotePeer.objects.create(
             profile=self.profile,
-            rid="logical-export-peer",
+            rid="logical-peer",
             rhash=self.CANARY,
             password="logical-export-password",  # noqa: S106 - encrypted-field regression input
         )

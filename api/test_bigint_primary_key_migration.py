@@ -200,37 +200,41 @@ class PostgreSQLBigintBoundaryTests(TransactionTestCase):
             self.skipTest("PostgreSQL sequence-width test")
 
     def test_retention_and_concurrent_inserts_cross_integer_boundary(self):
-        self._set_sequence("api_loginattempt", INTEGER_MAX - 1)
-        first = LoginAttempt.objects.create(ip="192.0.2.30", username="before-boundary")
-        LoginAttempt.objects.all().delete()
-        self.assertEqual(first.pk, INTEGER_MAX)
+        try:
+            self._set_sequence("api_loginattempt", INTEGER_MAX - 1)
+            first = LoginAttempt.objects.create(ip="192.0.2.30", username="before-boundary")
+            LoginAttempt.objects.all().delete()
+            self.assertEqual(first.pk, INTEGER_MAX)
 
-        barrier = threading.Barrier(3)
-        results = queue.Queue()
+            barrier = threading.Barrier(3)
+            results = queue.Queue()
 
-        def insert(ip):
-            close_old_connections()
-            try:
-                barrier.wait(timeout=5)
-                results.put(LoginAttempt.objects.create(ip=ip, username="concurrent-boundary").pk)
-            except (DatabaseError, threading.BrokenBarrierError) as exc:  # pragma: no cover - parent asserts
-                results.put(exc)
-            finally:
+            def insert(ip):
                 close_old_connections()
+                try:
+                    barrier.wait(timeout=5)
+                    results.put(LoginAttempt.objects.create(ip=ip, username="concurrent-boundary").pk)
+                except (DatabaseError, threading.BrokenBarrierError) as exc:  # pragma: no cover - parent asserts
+                    results.put(exc)
+                finally:
+                    close_old_connections()
 
-        workers = [
-            threading.Thread(target=insert, args=("192.0.2.31",)),
-            threading.Thread(target=insert, args=("192.0.2.32",)),
-        ]
-        for worker in workers:
-            worker.start()
-        barrier.wait(timeout=5)
-        for worker in workers:
-            worker.join(timeout=5)
-            self.assertFalse(worker.is_alive())
+            workers = [
+                threading.Thread(target=insert, args=("192.0.2.31",)),
+                threading.Thread(target=insert, args=("192.0.2.32",)),
+            ]
+            for worker in workers:
+                worker.start()
+            barrier.wait(timeout=5)
+            for worker in workers:
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
 
-        inserted = {results.get_nowait(), results.get_nowait()}
-        self.assertEqual(inserted, {1 << 31, (1 << 31) + 1})
+            inserted = {results.get_nowait(), results.get_nowait()}
+            self.assertEqual(inserted, {1 << 31, (1 << 31) + 1})
+        finally:
+            LoginAttempt.objects.all().delete()
+            self._set_sequence("api_loginattempt", 1, is_called=False)
 
     def test_scope_triggers_m2m_and_serialization_accept_high_ids(self):
         high_tables = (
@@ -244,53 +248,66 @@ class PostgreSQLBigintBoundaryTests(TransactionTestCase):
             "api_userprofile_groups",
             "api_userprofile_user_permissions",
         )
-        for table_name in high_tables:
-            self._set_sequence(table_name, INTEGER_MAX)
+        try:
+            for table_name in high_tables:
+                self._set_sequence(table_name, INTEGER_MAX)
 
-        owner = UserProfile.objects.create(username="bigint-test-owner")
-        profile = AddressBookProfile.objects.create(guid="bigint-test-profile", name="BigInt test", owner=owner)
-        peer = RemotePeer.objects.create(profile=profile, rid="bigint-test-peer")
-        tag = RemoteTag.objects.create(profile=profile, tag_name="BigInt test tag")
-        peer.tags.add(tag)
-        link = ShareLink.objects.create(
-            creator=owner,
-            shash="b" * 64,
-            token_prefix="bigint-test",  # noqa: S106 - non-secret test prefix
-        )
-        link.peers.add(peer)
-        group = Group.objects.create(name="bigint-test-group")
-        permission = Permission.objects.order_by("pk").first()
-        owner.groups.add(group)
-        owner.user_permissions.add(permission)
+            owner = UserProfile.objects.create(username="bigint-test-owner")
+            profile = AddressBookProfile.objects.create(guid="bigint-test-profile", name="BigInt test", owner=owner)
+            peer = RemotePeer.objects.create(profile=profile, rid="bigint-test-peer")
+            tag = RemoteTag.objects.create(profile=profile, tag_name="BigInt test tag")
+            peer.tags.add(tag)
+            link = ShareLink.objects.create(
+                creator=owner,
+                shash="b" * 64,
+                token_prefix="bigint-test",  # noqa: S106 - non-secret test prefix
+            )
+            link.peers.add(peer)
+            group = Group.objects.create(name="bigint-test-group")
+            permission = Permission.objects.order_by("pk").first()
+            owner.groups.add(group)
+            owner.user_permissions.add(permission)
 
-        peer_tag = RemotePeer.tags.through.objects.get()
-        share_peer = ShareLink.peers.through.objects.get()
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT id FROM api_userprofile_groups WHERE userprofile_id=%s", [owner.pk])
-            group_edge_id = cursor.fetchone()[0]
-            cursor.execute("SELECT id FROM api_userprofile_user_permissions WHERE userprofile_id=%s", [owner.pk])
-            permission_edge_id = cursor.fetchone()[0]
-        identifiers = (
-            owner.pk,
-            profile.pk,
-            peer.pk,
-            tag.pk,
-            peer_tag.pk,
-            link.pk,
-            share_peer.pk,
-            group_edge_id,
-            permission_edge_id,
-        )
-        self.assertTrue(all(identifier > INTEGER_MAX for identifier in identifiers))
-        self.assertEqual(peer_tag.profile_id, profile.pk)
-        self.assertEqual(share_peer.profile_id, profile.pk)
-        self.assertEqual(share_peer.owner_id, owner.pk)
-        self.assertEqual(json.loads(serializers.serialize("json", [owner]))[0]["pk"], owner.pk)
+            peer_tag = RemotePeer.tags.through.objects.get()
+            share_peer = ShareLink.peers.through.objects.get()
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id FROM api_userprofile_groups WHERE userprofile_id=%s", [owner.pk])
+                group_edge_id = cursor.fetchone()[0]
+                cursor.execute("SELECT id FROM api_userprofile_user_permissions WHERE userprofile_id=%s", [owner.pk])
+                permission_edge_id = cursor.fetchone()[0]
+            identifiers = (
+                owner.pk,
+                profile.pk,
+                peer.pk,
+                tag.pk,
+                peer_tag.pk,
+                link.pk,
+                share_peer.pk,
+                group_edge_id,
+                permission_edge_id,
+            )
+            self.assertTrue(all(identifier > INTEGER_MAX for identifier in identifiers))
+            self.assertEqual(peer_tag.profile_id, profile.pk)
+            self.assertEqual(share_peer.profile_id, profile.pk)
+            self.assertEqual(share_peer.owner_id, owner.pk)
+            self.assertEqual(json.loads(serializers.serialize("json", [owner]))[0]["pk"], owner.pk)
 
-        with self.assertRaisesRegex(RuntimeError, "cannot narrow api_userprofile_groups.id"):
-            MigrationExecutor(connection).migrate([MIGRATE_FROM])
+            with self.assertRaisesRegex(RuntimeError, "cannot narrow api_userprofile_groups.id"):
+                MigrationExecutor(connection).migrate([MIGRATE_FROM])
+        finally:
+            if connection.vendor == "postgresql":
+                with connection.cursor() as cursor:
+                    for table_name in high_tables:
+                        cursor.execute("SELECT pg_get_serial_sequence(%s, 'id')", [table_name])
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            cursor.execute("SELECT setval(%s, 1, false)", [row[0]])
+            restore_latest_migration_state()
 
     @staticmethod
-    def _set_sequence(table_name, value):
+    def _set_sequence(table_name, value, is_called=True):
         with connection.cursor() as cursor:
-            cursor.execute("SELECT setval(pg_get_serial_sequence(%s, 'id'), %s, true)", [table_name, value])
+            cursor.execute(
+                "SELECT setval(pg_get_serial_sequence(%s, 'id'), %s, %s)",
+                [table_name, value, is_called],
+            )

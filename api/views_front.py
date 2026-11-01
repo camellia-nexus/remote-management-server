@@ -870,7 +870,7 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
         if not profile:
             return False, _("授权已变更，操作未提交。")
         rule_obj = (
-            AddressBookRule.objects.select_for_update()
+            AddressBookRule.objects.select_for_update(of=("self",))
             .select_related("user", "group")
             .filter(pk=rule_obj.pk, profile=profile)
             .first()

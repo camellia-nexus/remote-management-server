@@ -3598,7 +3598,7 @@ def ab_rule(request):
             changed = share
         else:
             rule_obj = (
-                AddressBookRule.objects.select_for_update()
+                AddressBookRule.objects.select_for_update(of=("self",))
                 .select_related("user", "group")
                 .filter(pk=rule_obj.pk, profile=profile)
                 .first()
@@ -3673,7 +3673,7 @@ def ab_rules_delete(request):
                 if not profile:
                     continue
                 rule_obj = (
-                    AddressBookRule.objects.select_for_update()
+                    AddressBookRule.objects.select_for_update(of=("self",))
                     .select_related("user", "group")
                     .filter(pk=rule_obj.pk, profile=profile)
                     .first()

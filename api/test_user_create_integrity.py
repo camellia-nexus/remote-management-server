@@ -130,11 +130,36 @@ class UserCreateIntegrityClassificationTests(TestCase):
         self.assertTrue(Group.objects.filter(pk=group.pk).exists())
 
 
-@override_settings(STORAGES=TEST_STORAGES)
+@override_settings(
+    STORAGES=TEST_STORAGES,
+    REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_CREDENTIAL_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_POLICY_OVERRIDES={
+        "mutation": {
+            "global": 10_000,
+            "source": 10_000,
+            "credential": 10_000,
+            "actor": 10_000,
+            "device": 10_000,
+            "concurrency": 64,
+        }
+    },
+)
 class PostgreSQLUserCreateConcurrencyTests(TransactionTestCase):
     password = "F6!zQ2@vT7#mL4$xR8&k"  # noqa: S105 - isolated test credential
 
     def setUp(self):
+        UserProfile.objects.filter(
+            username__in=[
+                "concurrent-user-create-admin",
+                "concurrent-group-user-a",
+                "concurrent-group-user-b",
+                "Ä-Concurrent-Race",
+                "ä-CONCURRENT-RACE",
+            ]
+        ).delete()
+        UserProfile.objects.by_username("ä-concurrent-race").delete()
+        Group.objects.filter(name="shared-concurrent-group").delete()
         self.admin = UserProfile.objects.create_superuser(
             "concurrent-user-create-admin",
             "concurrent-user-create-admin-password",  # noqa: S106 - isolated test credential
@@ -152,6 +177,19 @@ class PostgreSQLUserCreateConcurrencyTests(TransactionTestCase):
             version="test",
         )
         _token, self.bearer = _issue_access_token(self.admin, device)
+
+    def tearDown(self):
+        UserProfile.objects.filter(
+            username__in=[
+                "concurrent-user-create-admin",
+                "concurrent-group-user-a",
+                "concurrent-group-user-b",
+                "Ä-Concurrent-Race",
+                "ä-CONCURRENT-RACE",
+            ]
+        ).delete()
+        UserProfile.objects.by_username("ä-concurrent-race").delete()
+        Group.objects.filter(name="shared-concurrent-group").delete()
 
     def create_user(self, username, *, group_name=""):
         close_old_connections()
@@ -174,26 +212,20 @@ class PostgreSQLUserCreateConcurrencyTests(TransactionTestCase):
 
     @skipUnlessDBFeature("has_select_for_update")
     def test_concurrent_distinct_users_share_one_new_group_without_false_conflict(self):
-        barrier = threading.Barrier(2)
-        original_create = Group.objects.create
+        barrier = threading.Barrier(3)
 
-        def create_group(*args, **kwargs):
+        def create(username):
             barrier.wait(timeout=20)
-            return original_create(*args, **kwargs)
-
-        with (
-            patch.object(Group.objects, "create", side_effect=create_group),
-            concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
-        ):
-            responses = list(
-                executor.map(
-                    lambda username: self.create_user(
-                        username,
-                        group_name="shared-concurrent-group",
-                    ),
-                    ("concurrent-group-user-a", "concurrent-group-user-b"),
-                )
+            return self.create_user(
+                username,
+                group_name="shared-concurrent-group",
             )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(create, "concurrent-group-user-a")
+            second = executor.submit(create, "concurrent-group-user-b")
+            barrier.wait(timeout=20)
+            responses = [first.result(timeout=60), second.result(timeout=60)]
 
         self.assertEqual([response.status_code for response in responses], [200, 200])
         group = Group.objects.get(name="shared-concurrent-group")
@@ -204,23 +236,17 @@ class PostgreSQLUserCreateConcurrencyTests(TransactionTestCase):
 
     @skipUnlessDBFeature("has_select_for_update")
     def test_concurrent_canonical_username_collision_has_one_stable_winner(self):
-        barrier = threading.Barrier(2)
-        original_create_user = UserProfile.objects.create_user
+        barrier = threading.Barrier(3)
 
-        def create_user(*args, **kwargs):
+        def create(username):
             barrier.wait(timeout=20)
-            return original_create_user(*args, **kwargs)
+            return self.create_user(username)
 
-        with (
-            patch.object(UserProfile.objects, "create_user", side_effect=create_user),
-            concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
-        ):
-            responses = list(
-                executor.map(
-                    self.create_user,
-                    ("Ä-Concurrent-Race", "ä-CONCURRENT-RACE"),
-                )
-            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(create, "Ä-Concurrent-Race")
+            second = executor.submit(create, "ä-CONCURRENT-RACE")
+            barrier.wait(timeout=20)
+            responses = [first.result(timeout=60), second.result(timeout=60)]
 
         self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
         conflict = next(response for response in responses if response.status_code == 409)

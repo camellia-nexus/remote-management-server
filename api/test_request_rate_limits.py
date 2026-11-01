@@ -4,7 +4,7 @@ import hashlib
 import ipaddress
 from unittest.mock import patch
 
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, connections
 from django.db.models import Count
 from django.db.utils import OperationalError
 from django.test import Client, RequestFactory, TestCase, TransactionTestCase, override_settings
@@ -380,7 +380,7 @@ class PostgreSQLRateLimitConcurrencyTests(TransactionTestCase):
                 admission = reserve_shared_budgets((Budget("source", "concurrency-test", "203.0.113.10/32", 7, 60),))
                 return admission.allowed
             finally:
-                close_old_connections()
+                connections.close_all()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(attempt, range(workers)))
@@ -402,7 +402,7 @@ class PostgreSQLRateLimitConcurrencyTests(TransactionTestCase):
                 budgets = (first, second) if index % 2 else (second, first)
                 return reserve_shared_budgets(budgets).allowed
             finally:
-                close_old_connections()
+                connections.close_all()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(attempt, range(workers)))
@@ -429,7 +429,7 @@ class PostgreSQLRateLimitConcurrencyTests(TransactionTestCase):
                 )
                 return admission.allowed
             finally:
-                close_old_connections()
+                connections.close_all()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(attempt, range(workers)))
@@ -456,7 +456,7 @@ class PostgreSQLRateLimitConcurrencyTests(TransactionTestCase):
                 )
                 return admission.allowed
             finally:
-                close_old_connections()
+                connections.close_all()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(attempt, range(workers)))

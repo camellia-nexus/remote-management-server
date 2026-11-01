@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from unittest import mock
 
 from django.db import close_old_connections, connections
@@ -91,6 +92,8 @@ class PostgreSQLUserDeletionLockOrderTests(TransactionTestCase):
             data="{}",
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=f"v2:{uuid.uuid4()}",
+            HTTP_IF_MATCH='"0"',
         )
 
     def assert_user_fully_deleted(self):

@@ -9,7 +9,8 @@ from django.test import Client, TestCase, TransactionTestCase, override_settings
 
 from api.admin_site import CamelliaAdminSite
 from api.login_admission import reserve_login_attempt
-from api.models import LoginAttempt, UserProfile
+from api.models import LoginAttempt, RequestRateBucket, UserProfile
+from api.rate_limits import reset_local_rate_limit_state
 
 ADMIN_USERNAME = "admin-admission-canary"
 ADMIN_PASSWORD = "correct-admin-admission-password"  # noqa: S105 - isolated test credential
@@ -129,8 +130,25 @@ class AdminAdmissionTests(TestCase):
         self.assertEqual(post_admin_login(client, "wrong-password").status_code, 429)
 
 
-@override_settings(STORAGES=TEST_STORAGES)
+@override_settings(
+    STORAGES=TEST_STORAGES,
+    REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_POLICY_OVERRIDES={
+        "authentication": {
+            "global": 10_000,
+            "source": 10_000,
+            "credential": 10_000,
+            "actor": 10_000,
+            "device": 10_000,
+            "concurrency": 64,
+        }
+    },
+)
 class PostgreSQLAdminAdmissionTests(TransactionTestCase):
+    def setUp(self):
+        reset_local_rate_limit_state()
+        RequestRateBucket.objects.all().delete()
+
     @skipUnlessDBFeature("has_select_for_update")
     def test_concurrent_admin_authentication_is_serialized(self):
         UserProfile.objects.create_superuser(ADMIN_USERNAME, ADMIN_PASSWORD)

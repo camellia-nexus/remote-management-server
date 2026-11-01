@@ -145,7 +145,7 @@ class State040ControlMutationTests(TestCase):
         )
         operation_id = uuid.uuid4()
         path = f"/api/ab/peer/add/{profile.guid}"
-        payload = {"id": "personal-privacy-peer", "hash": "SYNTHETIC-PERSONAL-HASH-A"}
+        payload = {"id": "privacy-peer", "hash": "SYNTHETIC-PERSONAL-HASH-A"}
         response = self._json("post", path, payload, operation_id=operation_id, if_match='"0"')
         self.assertEqual(response.status_code, 200, response.content)
         different_secret = {**payload, "hash": "SYNTHETIC-PERSONAL-HASH-B"}
@@ -587,7 +587,7 @@ class State040ControlMutationTests(TestCase):
         operation_id = uuid.uuid4()
 
         def failing_view(_request, guid):
-            RemotePeer.objects.create(profile=profile, rid="state040-transient-peer")
+            RemotePeer.objects.create(profile=profile, rid="transient-peer")
             return JsonResponse({"error": "temporary"}, status=503)
 
         wrapped = replayable_stateless_api(
@@ -597,7 +597,7 @@ class State040ControlMutationTests(TestCase):
         )
         request = RequestFactory().post(
             f"/api/ab/peer/add/{profile.guid}",
-            data=json.dumps({"id": "state040-transient-peer"}),
+            data=json.dumps({"id": "transient-peer"}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
             HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
@@ -605,7 +605,7 @@ class State040ControlMutationTests(TestCase):
         )
         response = wrapped(request, guid=profile.guid)
         self.assertEqual(response.status_code, 503, response.content)
-        self.assertFalse(RemotePeer.objects.filter(profile=profile, rid="state040-transient-peer").exists())
+        self.assertFalse(RemotePeer.objects.filter(profile=profile, rid="transient-peer").exists())
         self.assertFalse(ManagementBatchOperation.objects.filter(operation_id=operation_id).exists())
 
     def test_share_create_and_accept_recover_the_first_result(self):
@@ -952,7 +952,19 @@ class State040ControlMutationTests(TestCase):
     STORAGES={
         "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
         "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
-    }
+    },
+    REQUEST_RATE_LIMIT_CREDENTIAL_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_POLICY_OVERRIDES={
+        "mutation": {
+            "global": 10_000,
+            "source": 10_000,
+            "credential": 10_000,
+            "actor": 10_000,
+            "device": 10_000,
+            "concurrency": 64,
+        }
+    },
 )
 class State040ConcurrencyTests(TransactionTestCase):
     @skipUnlessDBFeature("has_select_for_update")
@@ -997,7 +1009,8 @@ class State040ConcurrencyTests(TransactionTestCase):
             barrier.wait(timeout=30)
             responses = [future.result(timeout=120) for future in futures]
 
-        self.assertTrue(all(response.status_code == 200 for response in responses))
+        status_codes = [response.status_code for response in responses]
+        self.assertTrue(all(code == 200 for code in status_codes), f"Expected all 200, got: {status_codes}")
         first_body = responses[0].json()
         self.assertTrue(all(response.json() == first_body for response in responses))
         self.assertEqual(DeviceGroup.objects.filter(name="state040-concurrent-group").count(), 1)

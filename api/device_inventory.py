@@ -97,7 +97,7 @@ class DeviceInventoryRow:
             platform=str(item["inventory_platform"] or ""),
             cpu=str(item["inventory_cpu"] or ""),
             memory=str(item["inventory_memory"] or ""),
-            ip_address=str(item["inventory_ip_address"] or ""),
+            ip_address=str(item["inventory_ip_address"] or "").split("/")[0],
             version=str(item["inventory_version"] or ""),
             device_note=str(item["inventory_device_note"] or ""),
             peer_note=str(item["inventory_peer_note"] or ""),

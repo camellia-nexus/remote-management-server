@@ -60,7 +60,6 @@ class SensitiveResponseSecurityTests(TestCase):
         self.assertEqual(device_export.status_code, 200)
         self.assertTrue(device_export.streaming)
         self.assert_never_stored(device_export)
-        device_export.close()
 
     def test_sensitive_front_route_inventory_is_marked(self):
         sensitive_paths = (
