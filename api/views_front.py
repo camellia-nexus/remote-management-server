@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import logging
@@ -32,7 +33,7 @@ from api.audit_queries import AUDIT_SEARCH_MAX_LENGTH, AUDIT_SEARCH_MIN_LENGTH, 
 from api.browser_mutations import replayable_address_book_form
 from api.device_inventory import DeviceInventory, InventoryPageSource
 from api.formatting import format_bytes
-from api.identifiers import InvalidIdentifier
+from api.identifiers import InvalidIdentifier, parse_model_pk_list, parse_remote_id
 from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
 from api.management_operations import (
     ManagementMutation,
@@ -530,8 +531,8 @@ def _lock_profile_for_content_write(user, profile):
 
 
 def _lock_profile_for_management(user, profile):
-    current, _owner, _rule = lock_profile_access(user, profile.pk)
-    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk)):
+    current, _owner, rule = lock_profile_access(user, profile.pk)
+    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk) and rule != 3):
         return None
     return current
 
@@ -634,14 +635,10 @@ def _valid_form_text(value, *, max_chars, max_bytes, strip=True):
 
 
 def _valid_peer_id(value):
-    value = _valid_form_text(
-        str(value or "").strip(),
-        max_chars=255,
-        max_bytes=1024,
-    )
-    if not value or any(character.isspace() for character in value):
+    try:
+        return parse_remote_id(value)
+    except InvalidIdentifier:
         return None
-    return value
 
 
 def _peer_form_payload(post):
@@ -820,8 +817,12 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
         profile = share.profile
         if not profile:
             return False, _("规则不存在。")
-        if not user.is_admin and str(profile.owner_id) != str(user.id):
+        access_rule = 3 if (user.is_admin or str(profile.owner_id) == str(user.id)) else _get_rule_access(profile, user)
+        if access_rule != 3:
             return False, _("无权限操作该地址簿。")
+        is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+        if (rule_value == 3 or share.rule == 3) and not is_owner_or_admin:
+            return False, _("仅拥有者或管理员可以管理完全控制权限。")
         with transaction.atomic():
             profile = _lock_profile_for_management(user, profile)
             if not profile:
@@ -834,6 +835,8 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
             )
             if not share:
                 return False, _("规则不存在。")
+            if share.rule == 3 and not is_owner_or_admin:
+                return False, _("仅拥有者或管理员可以管理完全控制权限。")
             if action == "delete_rule":
                 bump_locked_authorization_generation(profile)
                 _audit_share(profile, user, "share_delete", share, details)
@@ -863,8 +866,12 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
     profile = rule_obj.profile
     if not profile:
         return False, _("规则不存在。")
-    if not user.is_admin and str(profile.owner_id) != str(user.id):
+    access_rule = 3 if (user.is_admin or str(profile.owner_id) == str(user.id)) else _get_rule_access(profile, user)
+    if access_rule != 3:
         return False, _("无权限操作该地址簿。")
+    is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+    if (rule_value == 3 or rule_obj.rule == 3) and not is_owner_or_admin:
+        return False, _("仅拥有者或管理员可以管理完全控制权限。")
     with transaction.atomic():
         profile = _lock_profile_for_management(user, profile)
         if not profile:
@@ -877,6 +884,8 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
         )
         if not rule_obj:
             return False, _("规则不存在。")
+        if rule_obj.rule == 3 and not is_owner_or_admin:
+            return False, _("仅拥有者或管理员可以管理完全控制权限。")
         if action == "delete_rule":
             bump_locked_authorization_generation(profile)
             _audit_rule(profile, user, "rule_delete", rule_obj, details)
@@ -1192,6 +1201,7 @@ def _accept_share_link(request, token_hash):
             )
         source_peers = list(
             link.peers.filter(profile__owner_id=link.creator_id)
+            .select_related("profile")
             .prefetch_related(
                 Prefetch(
                     "tags",
@@ -1261,6 +1271,16 @@ def _accept_share_link(request, token_hash):
         tags_by_name = {tag.tag_name: tag for tag in recipient_tags}
         imports = []
         for source in sources_to_import:
+            candidate_rhash = ""
+            if source.rhash:
+                candidate_rhash = source.rhash
+            else:
+                raw_secret = source.password
+                if not raw_secret and source.profile:
+                    raw_secret = getattr(source.profile, "default_password", "") or (source.profile.info or {}).get("password", "")
+                if raw_secret:
+                    candidate_rhash = base64.b64encode(raw_secret.encode("utf-8")).decode("ascii")
+
             peer = RemotePeer.objects.create(
                 profile=personal_profile,
                 rid=source.rid,
@@ -1268,7 +1288,7 @@ def _accept_share_link(request, token_hash):
                 hostname=source.hostname,
                 alias=source.alias,
                 platform=source.platform,
-                rhash=source.rhash,
+                rhash=candidate_rhash,
                 note=source.note,
                 password="",
                 device_group_name=source.device_group_name,
@@ -1472,8 +1492,19 @@ def share(request, share_token=None):
             return json_error("share_empty_selection", _("数据为空。"), status=400)
         if not isinstance(data, list) or not 1 <= len(data) <= MAX_SHARE_PEERS:
             return json_error("share_selection_limit", _("一次最多分享 20 台设备。"), status=400)
-        selected_keys = {str(item.get("value", "")).strip() for item in data if isinstance(item, dict)}
-        if len(selected_keys) != len(data) or any(not key.isdigit() for key in selected_keys):
+        raw_keys = [item.get("value") for item in data if isinstance(item, dict)]
+        if len(raw_keys) != len(data):
+            _log_event(
+                request,
+                "front_share_create_failed",
+                level="warning",
+                username=request.user.username,
+                reason="empty_ids",
+            )
+            return json_error("share_invalid_selection", _("设备选择无效。"), status=400)
+        try:
+            selected_keys = parse_model_pk_list(raw_keys, RemotePeer, max_items=MAX_SHARE_PEERS)
+        except InvalidIdentifier:
             _log_event(
                 request,
                 "front_share_create_failed",
@@ -1626,8 +1657,13 @@ def ab_manage(request):
             messages.error(request, _("地址簿不存在或不可配置。"))
             return HttpResponseRedirect("/api/ab_manage")
 
-        if not u.is_admin and str(profile.owner_id) != str(u.id):
+        access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else _get_rule_access(profile, u)
+        if access_rule != 3:
             messages.error(request, _("无权限操作该地址簿。"))
+            return HttpResponseRedirect("/api/ab_manage")
+        is_owner_or_admin = u.is_admin or str(profile.owner_id) == str(u.id)
+        if rule_value == 3 and not is_owner_or_admin:
+            messages.error(request, _("仅拥有者或管理员可以委派完全控制权限。"))
             return HttpResponseRedirect("/api/ab_manage")
 
         if action == "add_user_share":
@@ -1647,6 +1683,11 @@ def ab_manage(request):
                 if target.pk == profile.owner_id:
                     messages.error(request, _("所属用户已拥有完全权限。"))
                     return HttpResponseRedirect("/api/ab_manage")
+                if not is_owner_or_admin:
+                    existing_share = AddressBookShare.objects.filter(profile=profile, user=target).first()
+                    if existing_share and existing_share.rule == 3:
+                        messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 share, created = AddressBookShare.objects.update_or_create(
                     profile=profile,
                     user=target,
@@ -1673,6 +1714,11 @@ def ab_manage(request):
                 if not profile:
                     messages.error(request, _("授权已变更，操作未提交。"))
                     return HttpResponseRedirect("/api/ab_manage")
+                if not is_owner_or_admin:
+                    existing_rule = AddressBookRule.objects.filter(profile=profile, group=group).first()
+                    if existing_rule and existing_rule.rule == 3:
+                        messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 rule_obj, created = AddressBookRule.objects.update_or_create(
                     profile=profile,
                     group=group,
@@ -1695,6 +1741,11 @@ def ab_manage(request):
                 if not profile:
                     messages.error(request, _("授权已变更，操作未提交。"))
                     return HttpResponseRedirect("/api/ab_manage")
+                if not is_owner_or_admin:
+                    existing_everyone = AddressBookRule.objects.filter(profile=profile, is_everyone=True).first()
+                    if existing_everyone and existing_everyone.rule == 3:
+                        messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 rule_obj, created = AddressBookRule.objects.update_or_create(
                     profile=profile,
                     is_everyone=True,
@@ -1716,7 +1767,13 @@ def ab_manage(request):
 
     profiles_qs = AddressBookProfile.objects.exclude(guid__startswith="personal-").select_related("owner")
     if not u.is_admin:
-        profiles_qs = profiles_qs.filter(owner=u)
+        rule3_guids = set(AddressBookShare.objects.filter(user=u, rule=3).values_list("profile__guid", flat=True))
+        rule3_rule_qs = AddressBookRule.objects.filter(rule=3)
+        rule3_guids.update(rule3_rule_qs.filter(user=u).values_list("profile__guid", flat=True))
+        rule3_guids.update(rule3_rule_qs.filter(is_everyone=True).values_list("profile__guid", flat=True))
+        if u.groups.exists():
+            rule3_guids.update(rule3_rule_qs.filter(group__in=u.groups.all()).values_list("profile__guid", flat=True))
+        profiles_qs = profiles_qs.filter(Q(owner=u) | Q(guid__in=rule3_guids))
     if filter_q:
         profiles_qs = profiles_qs.filter(
             Q(name__icontains=filter_q) | Q(guid__icontains=filter_q) | Q(owner__username__icontains=filter_q)
@@ -1776,7 +1833,7 @@ def ab_manage(request):
                 }
                 if everyone_rule
                 else None,
-                "can_manage": u.is_admin or str(profile.owner_id) == str(u.id),
+                "can_manage": u.is_admin or str(profile.owner_id) == str(u.id) or _get_rule_access(profile, u) == 3,
             }
         )
 
@@ -1918,7 +1975,8 @@ def ab_books(request):
             if _is_personal_guid(profile.guid):
                 messages.error(request, _("个人地址簿不可修改。"))
                 return HttpResponseRedirect("/api/ab_books")
-            if not u.is_admin and str(profile.owner_id) != str(u.id):
+            access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else _get_rule_access(profile, u)
+            if access_rule != 3:
                 messages.error(request, _("无权限操作该地址簿。"))
                 return HttpResponseRedirect("/api/ab_books")
             name = _valid_form_text(
@@ -2272,7 +2330,8 @@ def ab_books(request):
                 "tags_count": tags_count,
                 "access_rule": access_rule,
                 "access_label": _rule_label(access_rule) if access_rule else _("无权限"),
-                "can_manage": u.is_admin or str(profile.owner_id) == str(u.id),
+                "can_manage": u.is_admin or str(profile.owner_id) == str(u.id) or access_rule == 3,
+                "can_delete": u.is_admin or str(profile.owner_id) == str(u.id),
                 "can_edit": can_edit,
                 "update_operation_id": str(uuid.uuid4()),
                 "delete_operation_id": str(uuid.uuid4()),
@@ -3177,23 +3236,25 @@ def ab_rules_export(request):
 
     if export_format == "xlsx":
         headers = [_("地址簿"), _("地址簿 GUID"), _("所属用户"), _("类型"), _("目标"), _("权限")]
-        return _address_book_export_response(
-            xlsx_response(
-                f"ab_rules_{filename_stamp}.xlsx",
-                _("地址簿规则"),
-                headers,
+        response = xlsx_response(
+            f"ab_rules_{filename_stamp}.xlsx",
+            _("地址簿规则"),
+            headers,
+            [
                 [
-                    [
-                        entry.get("profile_name", ""),
-                        entry.get("profile_guid", ""),
-                        entry.get("owner", ""),
-                        entry.get("target_type", ""),
-                        entry.get("target_name", ""),
-                        entry.get("rule_label", ""),
-                    ]
-                    for entry in rules
-                ],
-            ),
+                    entry.get("profile_name", ""),
+                    entry.get("profile_guid", ""),
+                    entry.get("owner", ""),
+                    entry.get("target_type", ""),
+                    entry.get("target_name", ""),
+                    entry.get("rule_label", ""),
+                ]
+                for entry in rules
+            ],
+        )
+        _log_event(request, "front_ab_rules_export", username=u.username, count=len(rules))
+        return _address_book_export_response(
+            response,
             export_format=export_format,
         )
 
@@ -3213,6 +3274,7 @@ def ab_rules_export(request):
         )
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_rules_{filename_stamp}.csv"
+    _log_event(request, "front_ab_rules_export", username=u.username, count=len(rules))
     return _address_book_export_response(response, export_format=export_format)
 
 

@@ -12,6 +12,9 @@ from api.identifiers import (
     model_pk_maximum,
     parse_model_pk,
     parse_model_pk_list,
+    parse_profile_guid,
+    parse_remote_id,
+    parse_remote_id_list,
     parse_uuid,
     parse_uuid_list,
 )
@@ -503,3 +506,100 @@ class TypedIdentifierParserTests(TestCase):
                 parse_uuid_list([str(expected), "not-a-uuid"], max_items=2)
             with self.assertRaises(InvalidIdentifier):
                 parse_model_pk_list(["1"] * 501, UserProfile, max_items=500)
+
+    def test_remote_id_parser_enforces_bounds_and_character_set_without_queries(self):
+        with self.assertNumQueries(0):
+            # Valid cases: 6 to 16 characters, ASCII alphanumeric, hyphen, underscore
+            for valid_id in (
+                "123456",
+                "123456789",
+                "1234567890123456",
+                "peer-01",
+                "device_node-99",
+                "AbCdEf-12_34",
+            ):
+                with self.subTest(valid_id=valid_id):
+                    self.assertEqual(parse_remote_id(valid_id), valid_id)
+
+            # Invalid cases: too short (< 6), too long (> 16), whitespace, non-ascii, special chars, wrong types
+            for invalid_id in (
+                None,
+                123456,
+                1234567890123456,
+                [],
+                {},
+                "",
+                "1",
+                "12345",  # length 5
+                "12345678901234567",  # length 17
+                "a" * 255,
+                " 123456",
+                "123456 ",
+                "123 456",
+                "123456\n",
+                "１２３４５６",  # full-width unicode
+                "peer@host",
+                "peer#1",
+                "peer$123",
+                "peer.node",
+            ):
+                with self.subTest(invalid_id=repr(invalid_id)), self.assertRaises(InvalidIdentifier):
+                    parse_remote_id(invalid_id)
+
+    def test_remote_id_list_parser_rejects_duplicates_and_invalid_items(self):
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                parse_remote_id_list(["123456", "peer-01", "node_02"], max_items=5),
+                ["123456", "peer-01", "node_02"],
+            )
+            # Duplicate IDs
+            with self.assertRaises(InvalidIdentifier):
+                parse_remote_id_list(["123456", "123456"], max_items=5)
+            # Contains invalid ID
+            with self.assertRaises(InvalidIdentifier):
+                parse_remote_id_list(["123456", "12345"], max_items=5)
+            # Exceeds max items
+            with self.assertRaises(InvalidIdentifier):
+                parse_remote_id_list(["123456", "peer-01"], max_items=1)
+            # Non-list
+            with self.assertRaises(InvalidIdentifier):
+                parse_remote_id_list("123456", max_items=5)
+
+    def test_profile_guid_parser_accepts_personal_and_hex_guids_without_queries(self):
+        with self.assertNumQueries(0):
+            # Personal profile GUIDs
+            self.assertEqual(parse_profile_guid("personal-1"), "personal-1")
+            self.assertEqual(parse_profile_guid("personal-42"), "personal-42")
+            self.assertEqual(parse_profile_guid("personal-999999"), "personal-999999")
+
+            # 32-hex shared profile GUIDs (normalized to lowercase)
+            hex_guid = "0123456789abcdef0123456789abcdef"
+            self.assertEqual(parse_profile_guid(hex_guid), hex_guid)
+            self.assertEqual(parse_profile_guid(hex_guid.upper()), hex_guid)
+
+            # ASCII slug profile GUIDs
+            self.assertEqual(parse_profile_guid("state040-password-profile"), "state040-password-profile")
+            self.assertEqual(parse_profile_guid("authorization-barrier-book"), "authorization-barrier-book")
+            self.assertEqual(parse_profile_guid("bigint_test-profile-01"), "bigint_test-profile-01")
+
+            # Invalid profile GUIDs
+            for invalid_guid in (
+                None,
+                123,
+                [],
+                {},
+                "",
+                "a" * 61,
+                "invalid@guid!",
+                "guid with space",
+                "guid#hash",
+                "guid$dollar",
+                "guid.dot",
+                "guid/slash",
+                "guid中文",
+                " " + hex_guid,
+                hex_guid + " ",
+            ):
+                with self.subTest(invalid_guid=repr(invalid_guid)), self.assertRaises(InvalidIdentifier):
+                    parse_profile_guid(invalid_guid)
+

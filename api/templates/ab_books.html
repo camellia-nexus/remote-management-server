@@ -112,6 +112,8 @@
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
               </div>
             </form>
+          {% endif %}
+          {% if item.can_delete and not item.is_personal %}
             <form class="action-panel action-panel--danger" method="post" action="/api/ab_books" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="action" value="delete_book">

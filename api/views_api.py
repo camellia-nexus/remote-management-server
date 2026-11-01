@@ -72,6 +72,9 @@ from api.identifiers import (
     InvalidIdentifier,
     parse_model_pk,
     parse_model_pk_list,
+    parse_profile_guid,
+    parse_remote_id,
+    parse_remote_id_list,
     parse_uuid,
     parse_uuid_list,
 )
@@ -1210,8 +1213,8 @@ def _lock_profile_for_content_write(user, profile):
 
 
 def _lock_profile_for_management(user, profile):
-    current, _owner, _rule = lock_profile_access(user, profile.pk)
-    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk)):
+    current, _owner, rule = lock_profile_access(user, profile.pk)
+    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk) and rule != 3):
         return None
     return current
 
@@ -1631,8 +1634,9 @@ def _validated_peer_payload(data, is_personal, require_id=True):
         "loginName": (60, 240),
     }
     if require_id or "id" in data:
-        rid = _bounded_text_value(data.get("id"), 1024, False)
-        if rid is None or len(rid) > 255 or any(ch.isspace() for ch in rid):
+        try:
+            rid = parse_remote_id(data.get("id"))
+        except InvalidIdentifier:
             return None
         result["id"] = rid
     for key, (max_chars, max_bytes) in field_limits.items():
@@ -3056,9 +3060,10 @@ def ab_shared_credential(request):
         _log_event(request, "api_ab_shared_credential_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json_object(request)
-    guid = _bounded_text_value(postdata.get("guid"), 60, allow_empty=False)
-    rid = _bounded_text_value(postdata.get("id"), 16, allow_empty=False)
-    if guid is None or rid is None or any(ch.isspace() for ch in rid):
+    try:
+        guid = parse_profile_guid(postdata.get("guid"))
+        rid = parse_remote_id(postdata.get("id"))
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid target"}, status=400)
 
     with transaction.atomic():
@@ -3099,7 +3104,10 @@ def ab_shared_add(request):
         _log_event(request, "api_ab_shared_add_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json_object(request)
-    name = str(postdata.get("name", "")).strip()
+    raw_name = postdata.get("name")
+    if not isinstance(raw_name, str):
+        return JsonResponse({"error": "Invalid name"}, status=400)
+    name = raw_name.strip()
     note = postdata.get("note", "")
     info = postdata.get("info", None)
     default_password = (
@@ -3187,7 +3195,10 @@ def ab_shared_update_profile(request):
         _log_event(request, "api_ab_shared_update_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json_object(request)
-    guid = postdata.get("guid", "")
+    try:
+        guid = parse_profile_guid(postdata.get("guid"))
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid guid"}, status=400)
     if not guid:
         return JsonResponse({"error": "Invalid guid"}, status=400)
     profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
@@ -3195,7 +3206,8 @@ def ab_shared_update_profile(request):
         return JsonResponse({"error": "Not found"}, status=404)
     if _is_personal_guid(profile.guid):
         return JsonResponse({"error": "Personal address book cannot be modified"}, status=403)
-    if not user.is_admin and str(profile.owner_id) != str(user.id):
+    access_rule = 3 if (user.is_admin or str(profile.owner_id) == str(user.id)) else _get_rule_access(profile, user)
+    if access_rule != 3:
         return JsonResponse({"error": "No access"}, status=403)
     operation_id, operation_error = _state040_operation_id(request)
     if operation_error:
@@ -3204,7 +3216,10 @@ def ab_shared_update_profile(request):
     if expected_generation is False:
         return JsonResponse({"error": "Invalid If-Match"}, status=400)
     if "name" in postdata:
-        name = str(postdata.get("name") or "").strip()
+        raw_name = postdata.get("name")
+        if not isinstance(raw_name, str):
+            return JsonResponse({"error": "Invalid name"}, status=400)
+        name = raw_name.strip()
         if (
             not name
             or len(name) > 60
@@ -3425,15 +3440,19 @@ def ab_rules(request):
     pagination, error_response = _pagination_or_error(request)
     if error_response:
         return error_response
-    guid = request.GET.get("ab", "") or request.GET.get("guid", "")
-    if not guid:
+    raw_guid = request.GET.get("ab", "") or request.GET.get("guid", "")
+    if not raw_guid:
+        return JsonResponse({"error": "Invalid guid"}, status=400)
+    try:
+        guid = parse_profile_guid(raw_guid)
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid guid"}, status=400)
     if _is_personal_guid(guid):
         return JsonResponse({"error": "Personal address book cannot be shared"}, status=403)
-    profile, _owner, _rule = _get_profile_access(user, guid)
+    profile, _owner, rule = _get_profile_access(user, guid)
     if not profile:
         return JsonResponse({"error": "Not found"}, status=404)
-    if not user.is_admin and str(profile.owner_id) != str(user.id):
+    if not user.is_admin and str(profile.owner_id) != str(user.id) and rule != 3:
         _log_event(request, "api_ab_rules_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
     data = []
@@ -3474,7 +3493,10 @@ def ab_rule(request):
         return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json_object(request)
     if request.method == "POST":
-        guid = postdata.get("guid", "")
+        try:
+            guid = parse_profile_guid(postdata.get("guid"))
+        except InvalidIdentifier:
+            return JsonResponse({"error": "Invalid guid"}, status=400)
         rule_value = _valid_ab_rule(postdata.get("rule", 1))
         if rule_value is None:
             return JsonResponse({"error": "Invalid rule"}, status=400)
@@ -3485,10 +3507,20 @@ def ab_rule(request):
             return JsonResponse({"error": "Not found"}, status=404)
         if _is_personal_guid(profile.guid):
             return JsonResponse({"error": "Personal address book cannot be shared"}, status=403)
-        if not user.is_admin and str(profile.owner_id) != str(user.id):
+        access_rule = 3 if (user.is_admin or str(profile.owner_id) == str(user.id)) else _get_rule_access(profile, user)
+        if access_rule != 3:
             return JsonResponse({"error": "No access"}, status=403)
-        user_name = postdata.get("user", "")
-        group_name = postdata.get("group", "")
+        is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+        if rule_value == 3 and not is_owner_or_admin:
+            return JsonResponse({"error": "Only owner or admin can grant full control"}, status=403)
+        raw_user = postdata.get("user")
+        raw_group = postdata.get("group")
+        if raw_user is not None and not isinstance(raw_user, str):
+            return JsonResponse({"error": "Invalid user"}, status=400)
+        if raw_group is not None and not isinstance(raw_group, str):
+            return JsonResponse({"error": "Invalid group"}, status=400)
+        user_name = raw_user.strip() if isinstance(raw_user, str) else ""
+        group_name = raw_group.strip() if isinstance(raw_group, str) else ""
         if user_name and group_name:
             return JsonResponse(
                 {"error": "Specify exactly one rule target"},
@@ -3511,6 +3543,10 @@ def ab_rule(request):
             if target_user:
                 if target_user.id == profile.owner_id:
                     return JsonResponse({"error": "Owner already has full access"}, status=400)
+                if not is_owner_or_admin:
+                    existing_share = AddressBookShare.objects.filter(profile=profile, user=target_user).first()
+                    if existing_share and existing_share.rule == 3:
+                        return JsonResponse({"error": "Only owner or admin can modify full control rules"}, status=403)
                 changed, created = AddressBookShare.objects.update_or_create(
                     profile=profile,
                     user=target_user,
@@ -3520,6 +3556,10 @@ def ab_rule(request):
                 target_name = target_user.username
             else:
                 if target_group:
+                    if not is_owner_or_admin:
+                        existing_rule = AddressBookRule.objects.filter(profile=profile, group=target_group).first()
+                        if existing_rule and existing_rule.rule == 3:
+                            return JsonResponse({"error": "Only owner or admin can modify full control rules"}, status=403)
                     changed, created = AddressBookRule.objects.update_or_create(
                         profile=profile,
                         group=target_group,
@@ -3530,6 +3570,10 @@ def ab_rule(request):
                         },
                     )
                 else:
+                    if not is_owner_or_admin:
+                        existing_everyone = AddressBookRule.objects.filter(profile=profile, is_everyone=True).first()
+                        if existing_everyone and existing_everyone.rule == 3:
+                            return JsonResponse({"error": "Only owner or admin can modify full control rules"}, status=403)
                     changed, created = AddressBookRule.objects.update_or_create(
                         profile=profile,
                         is_everyone=True,
@@ -3563,12 +3607,10 @@ def ab_rule(request):
         )
         return JsonResponse({"guid": changed.guid, "rule": changed.rule})
 
-    rule_guid = postdata.get("guid", "")
+    rule_guid = parse_uuid(postdata.get("guid"))
     rule_value = _valid_ab_rule(postdata.get("rule", 1))
     if rule_value is None:
         return JsonResponse({"error": "Invalid rule"}, status=400)
-    if not rule_guid:
-        return JsonResponse({"error": "Invalid guid"}, status=400)
     share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
     rule_obj = None
     if share:
@@ -3578,6 +3620,9 @@ def ab_rule(request):
         if not rule_obj:
             return JsonResponse({"error": "Not found"}, status=404)
         profile = rule_obj.profile
+    is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+    if (rule_value == 3 or (share and share.rule == 3) or (rule_obj and rule_obj.rule == 3)) and not is_owner_or_admin:
+        return JsonResponse({"error": "Only owner or admin can manage full control rules"}, status=403)
     with transaction.atomic():
         profile = _lock_profile_for_management(user, profile)
         if not profile:
@@ -3591,6 +3636,8 @@ def ab_rule(request):
             )
             if not share:
                 return JsonResponse({"error": "Not found"}, status=404)
+            if share.rule == 3 and not is_owner_or_admin:
+                return JsonResponse({"error": "Only owner or admin can manage full control rules"}, status=403)
             share.rule = rule_value
             share.save(update_fields=("rule",))
             target_type = "user"
@@ -3605,6 +3652,8 @@ def ab_rule(request):
             )
             if not rule_obj:
                 return JsonResponse({"error": "Not found"}, status=404)
+            if rule_obj.rule == 3 and not is_owner_or_admin:
+                return JsonResponse({"error": "Only owner or admin can manage full control rules"}, status=403)
             rule_obj.rule = rule_value
             rule_obj.save(update_fields=("rule", "updated_at"))
             if rule_obj.is_everyone:
@@ -3636,12 +3685,9 @@ def ab_rules_delete(request):
         _log_event(request, "api_ab_rules_delete_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json(request)
-    if not isinstance(postdata, list):
-        return JsonResponse({"error": "Invalid data"}, status=400)
-    if len(postdata) > 100:
-        return JsonResponse({"error": "Too many rules"}, status=400)
+    rule_guids = parse_uuid_list(postdata, max_items=100)
     deleted = 0
-    for rule_guid in postdata:
+    for rule_guid in rule_guids:
         share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if share:
             profile = share.profile
@@ -3656,6 +3702,9 @@ def ab_rules_delete(request):
                     .first()
                 )
                 if not share:
+                    continue
+                is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+                if share.rule == 3 and not is_owner_or_admin:
                     continue
                 target_name = share.user.username if share.user else ""
                 bump_locked_authorization_generation(profile)
@@ -3679,6 +3728,9 @@ def ab_rules_delete(request):
                     .first()
                 )
                 if not rule_obj:
+                    continue
+                is_owner_or_admin = user.is_admin or str(profile.owner_id) == str(user.id)
+                if rule_obj.rule == 3 and not is_owner_or_admin:
                     continue
                 if rule_obj.is_everyone:
                     target_type = "everyone"
@@ -3944,11 +3996,9 @@ def ab_peer_delete(request, guid):
         request,
         max_bytes=settings.JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
     )
-    if (
-        not isinstance(postdata, list)
-        or len(postdata) > 1000
-        or any(_bounded_text_value(value, 1024, False) is None for value in postdata)
-    ):
+    try:
+        peer_ids = parse_remote_id_list(postdata, max_items=1000)
+    except InvalidIdentifier:
         _log_event(
             request,
             "api_ab_peer_delete_failed",
@@ -3962,8 +4012,8 @@ def ab_peer_delete(request, guid):
         profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
         if not profile:
             return JsonResponse({"error": "Authorization changed"}, status=403)
-        RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
-    _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(postdata))
+        RemotePeer.objects.filter(profile=profile, rid__in=peer_ids).delete()
+    _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(peer_ids))
     return empty_success()
 
 
