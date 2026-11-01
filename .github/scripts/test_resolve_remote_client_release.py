@@ -10,7 +10,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 SCRIPT = Path(__file__).with_name("resolve-remote-client-release.py")
 SPEC = importlib.util.spec_from_file_location(
     "resolve_remote_client_release", SCRIPT

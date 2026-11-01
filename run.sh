@@ -139,4 +139,5 @@ exec gunicorn camellia_remote_management.wsgi:application \
     --access-logformat "$ACCESS_LOG_FORMAT" \
     --access-logfile "-" \
     --error-logfile "-" \
-    --capture-output
+    --capture-output \
+    --no-control-socket

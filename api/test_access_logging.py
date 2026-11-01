@@ -198,5 +198,6 @@ class SafeAccessLoggingTests(SimpleTestCase):
         )
         self.assertIn('--access-logformat "$ACCESS_LOG_FORMAT"', run_script)
         self.assertIn(SAFE_ACCESS_LOG_FORMAT, run_script)
+        self.assertIn("--no-control-socket", run_script)
         for forbidden_atom in ("%(r)s", "%(U)s", "%(q)s", "%(f)s", "%(a)s", "%(h)s"):
             self.assertNotIn(forbidden_atom, run_script)

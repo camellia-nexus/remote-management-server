@@ -14,7 +14,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 SEMVER = re.compile(

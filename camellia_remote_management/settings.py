@@ -338,7 +338,11 @@ if not DEBUG and not _secure_tls:
 SESSION_COOKIE_SECURE = _secure_tls
 CSRF_COOKIE_SECURE = _secure_tls
 CSRF_FAILURE_VIEW = "api.response_contract.csrf_failure"
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
+SECURE_PROXY_SSL_HEADER = (
+    ("HTTP_X_FORWARDED_PROTO", "https")
+    if (_secure_tls and TRUST_PROXY_HEADERS and bool(TRUSTED_PROXY_NETWORKS))
+    else None
+)
 SECURE_SSL_REDIRECT = _secure_tls
 SECURE_HSTS_SECONDS = env_int(
     "CAMELLIA_REMOTE_SECURE_HSTS_SECONDS",
@@ -819,6 +823,7 @@ MIDDLEWARE = [
     "api.middleware.RequestDeadlineMiddleware",
     "api.middleware.SafeAccessLogMiddleware",
     "api.middleware.DatabaseDeadlineMiddleware",
+    "api.middleware.TrustedProxyMiddleware",
     "api.rate_limits.IngressRateLimitMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",

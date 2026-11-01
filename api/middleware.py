@@ -32,6 +32,7 @@ from api.request_utils import (
     InvalidJsonPayload,
     JsonPayloadTooLarge,
     UnsupportedJsonMediaType,
+    is_trusted_proxy,
     load_json_form_field,
 )
 from api.response_contract import RESPONSE_MODE_JSON, apply_response_contract, json_error, response_mode
@@ -172,6 +173,23 @@ class DatabaseDeadlineMiddleware:
             if timeout_kind and not getattr(response, "_camellia_database_timeout", False):
                 return database_timeout_response(request, timeout_kind)
             return response
+
+
+class TrustedProxyMiddleware:
+    """Ensure proxy SSL headers are only accepted from explicitly trusted proxy networks."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if not is_trusted_proxy(request):
+            header_tuple = getattr(settings, "SECURE_PROXY_SSL_HEADER", None)
+            if header_tuple:
+                request.META.pop(header_tuple[0], None)
+            request.META.pop("HTTP_X_FORWARDED_PROTO", None)
+            request.META.pop("HTTP_X_FORWARDED_PROTOCOL", None)
+            request.META.pop("HTTP_X_FORWARDED_SSL", None)
+        return self.get_response(request)
 
 
 class StrictShareJsonPreflightMiddleware:

@@ -330,8 +330,10 @@ def user_register(request):
         result["msg"] = info
         _log_event(request, "front_register_failed", level="warning", username=username, reason="invalid_password")
         return JsonResponse(result, status=400)
+    email = request.POST.get("email", "").strip() if isinstance(request.POST.get("email"), str) else ""
+    candidate = UserProfile(username=username, email=email)
     try:
-        password_validation.validate_password(password1)
+        password_validation.validate_password(password1, user=candidate)
     except ValidationError:
         result["msg"] = _("密码强度不足，请使用更长且不常见的密码。")
         _log_event(request, "front_register_failed", level="warning", username=username, reason="weak_password")

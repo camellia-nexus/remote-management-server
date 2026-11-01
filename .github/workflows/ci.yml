@@ -63,8 +63,8 @@ jobs:
 
       - name: Static analysis
         run: |
-          uv run python -m compileall api webui2 camellia_remote_management scripts
-          uv run ruff check api webui2 camellia_remote_management scripts
+          uv run python -m compileall api webui2 camellia_remote_management scripts .github/scripts
+          uv run ruff check .
 
       - name: Django checks
         run: |

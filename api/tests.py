@@ -1,6 +1,7 @@
 import base64
 import datetime
 import hashlib
+import ipaddress
 import json
 import os
 import tempfile
@@ -1655,6 +1656,21 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertNotIn("error", mismatch.json())
         self.assertFalse(UserProfile.objects.filter(username="second-user").exists())
 
+    @override_settings(ALLOW_REGISTRATION=True)
+    def test_registration_rejects_password_similar_to_username(self):
+        UserProfile.objects.filter(username="similaruser").delete()
+        response = self.client.post(
+            "/api/user_action?action=register",
+            {
+                "user": "similaruser",
+                "pwd": "similaruser123",
+                "repassword": "similaruser123",
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["code"], "http_400_api_user_action")
+        self.assertFalse(UserProfile.objects.filter(username="similaruser").exists())
+
     @override_settings(PLUGIN_SIGNING_KEY="00" * 32)
     def test_plugin_raw_signing_oracle_is_not_routed(self):
         admin_token = self._login(
@@ -2455,6 +2471,8 @@ class OperationalEndpointTests(TestCase):
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
+        TRUST_PROXY_HEADERS=True,
+        TRUSTED_PROXY_NETWORKS=(ipaddress.ip_network("127.0.0.1/32"),),
         SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
         SECURE_SSL_REDIRECT=True,
     )
@@ -2463,13 +2481,40 @@ class OperationalEndpointTests(TestCase):
         self.assertEqual(insecure.status_code, 301)
         self.assertTrue(insecure["Location"].startswith("https://"))
 
+        # Untrusted peer address attempting to spoof X-Forwarded-Proto is stripped and redirected
+        spoofed = self.client.get(
+            "/health/ready",
+            REMOTE_ADDR="198.51.100.10",
+            HTTP_X_FORWARDED_PROTO="https",
+        )
+        self.assertEqual(spoofed.status_code, 301)
+        self.assertTrue(spoofed["Location"].startswith("https://"))
+
+        # Trusted reverse proxy forwarding TLS state is honored
         secure = self.client.get(
             "/health/ready",
+            REMOTE_ADDR="127.0.0.1",
             HTTP_X_FORWARDED_PROTO="https",
         )
         self.assertEqual(secure.status_code, 200)
         self.assertEqual(secure.json()["status"], "ready")
         self.assertEqual(secure.json()["response_schema_version"], 1)
+
+    @override_settings(
+        DEVICE_VERIFICATION_TOKEN="v" * 48,
+        TRUST_PROXY_HEADERS=False,
+        TRUSTED_PROXY_NETWORKS=(ipaddress.ip_network("127.0.0.1/32"),),
+        SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
+        SECURE_SSL_REDIRECT=True,
+    )
+    def test_tls_readiness_probe_rejects_forwarded_proto_when_proxy_headers_disabled(self):
+        response = self.client.get(
+            "/health/ready",
+            REMOTE_ADDR="127.0.0.1",
+            HTTP_X_FORWARDED_PROTO="https",
+        )
+        self.assertEqual(response.status_code, 301)
+        self.assertTrue(response["Location"].startswith("https://"))
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="",

@@ -270,6 +270,21 @@ def _canonical_ip(value):
         return ""
 
 
+def is_trusted_proxy(request):
+    """Return whether the transport-level peer matches trusted proxy networks."""
+    if not getattr(settings, "TRUST_PROXY_HEADERS", False):
+        return False
+    remote = _canonical_ip(request.META.get("REMOTE_ADDR"))
+    if not remote:
+        return False
+    try:
+        remote_address = ipaddress.ip_address(remote)
+    except ValueError:
+        return False
+    trusted_networks = getattr(settings, "TRUSTED_PROXY_NETWORKS", ())
+    return any(remote_address in network for network in trusted_networks)
+
+
 def client_ip(request):
     """Return a bounded, canonical address for auditing and rate limiting.
 
@@ -279,17 +294,14 @@ def client_ip(request):
     """
 
     remote = _canonical_ip(request.META.get("REMOTE_ADDR"))
-    if getattr(settings, "TRUST_PROXY_HEADERS", False) and remote:
-        remote_address = ipaddress.ip_address(remote)
-        trusted_networks = getattr(settings, "TRUSTED_PROXY_NETWORKS", ())
-        if any(remote_address in network for network in trusted_networks):
-            forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
-            forwarded_first = _canonical_ip(forwarded.split(",", 1)[0])
-            if forwarded_first:
-                return forwarded_first
-            real_ip = _canonical_ip(request.META.get("HTTP_X_REAL_IP"))
-            if real_ip:
-                return real_ip
+    if remote and is_trusted_proxy(request):
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+        forwarded_first = _canonical_ip(forwarded.split(",", 1)[0])
+        if forwarded_first:
+            return forwarded_first
+        real_ip = _canonical_ip(request.META.get("HTTP_X_REAL_IP"))
+        if real_ip:
+            return real_ip
     # Keep audit/rate-limit keys valid and fail closed when the server did not
     # receive a usable transport address.
     return remote or "0.0.0.0"  # noqa: S104 - non-routable audit sentinel, not a bind address
