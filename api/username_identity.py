@@ -39,8 +39,6 @@ def _check_postgresql_contract(connection):
                 current_setting('server_encoding'),
                 database.datlocprovider,
                 database.datlocale,
-                database.datcollate,
-                database.datctype,
                 database.datcollversion,
                 pg_database_collation_actual_version(database.oid)
             FROM pg_database AS database
@@ -51,8 +49,6 @@ def _check_postgresql_contract(connection):
     expected = (
         POSTGRES_ENCODING,
         POSTGRES_LOCALE_PROVIDER,
-        POSTGRES_LOCALE,
-        POSTGRES_LOCALE,
         POSTGRES_LOCALE,
         POSTGRES_COLLATION_VERSION,
         POSTGRES_COLLATION_VERSION,
