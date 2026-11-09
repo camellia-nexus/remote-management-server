@@ -79,6 +79,39 @@ RUN locked_revision="$(tr -d '\r\n' < web-client.lock)" \
        else \
          mkdir -p static/web_client && echo "${locked_revision} clean" > static/web_client/.source_revision; \
        fi \
+    && if [ -f static/web_client/web_client_manifest.json ]; then \
+         python3 -c '
+import hashlib, json, sys
+from pathlib import Path
+
+root = Path("static/web_client")
+locked_rev = sys.argv[1].strip()
+manifest = json.loads((root / "web_client_manifest.json").read_text(encoding="utf-8"))
+if manifest.get("schema_version") != 1:
+    sys.exit("invalid manifest schema_version")
+if manifest.get("source_revision") != locked_rev:
+    sys.exit("manifest source_revision does not match locked_revision")
+files = manifest.get("files", {})
+lines = []
+for rel, spec in sorted(files.items()):
+    fp = root / rel
+    if not fp.is_file() or fp.is_symlink():
+        sys.exit(f"missing or invalid file: {rel}")
+    data = fp.read_bytes()
+    expected_size = spec["size"]
+    if len(data) != expected_size:
+        sys.exit(f"size mismatch for {rel}")
+    sha = hashlib.sha256(data).hexdigest()
+    expected_sha = spec["sha256"]
+    if sha.lower() != expected_sha.lower():
+        sys.exit(f"hash mismatch for {rel}")
+    lines.append(f"{rel}:{expected_size}:{expected_sha}")
+expected_root = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+manifest_root = manifest.get("root_digest", "")
+if expected_root.lower() != manifest_root.lower():
+    sys.exit("root_digest mismatch in web_client_manifest.json")
+' "$locked_revision"; \
+       fi \
     && mkdir -p records static_root \
     && chown appuser:appuser records static_root
 

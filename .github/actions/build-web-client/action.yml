@@ -195,25 +195,56 @@ runs:
           exit 1
         fi
         python3 -c '
-import hashlib, json, sys
+import hashlib, json, os, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+expected_rev = sys.argv[2]
 manifest_path = root / "web_client_manifest.json"
+if not manifest_path.is_file():
+    sys.exit("Missing web_client_manifest.json")
 with manifest_path.open("r", encoding="utf-8") as f:
     manifest = json.load(f)
 
-for rel, spec in manifest.get("files", {}).items():
+if manifest.get("schema_version") != 1:
+    sys.exit("Invalid manifest schema_version")
+actual_rev = manifest.get("source_revision")
+if actual_rev != expected_rev:
+    sys.exit(f"Manifest source revision mismatch: expected {expected_rev}, got {actual_rev}")
+
+files = manifest.get("files", {})
+if not files:
+    sys.exit("Manifest has no files")
+
+lines = []
+for rel, spec in sorted(files.items()):
     fp = root / rel
-    if not fp.is_file():
-        sys.exit(f"Missing file declared in manifest: {rel}")
+    if not fp.is_file() or fp.is_symlink():
+        sys.exit(f"Missing or invalid file declared in manifest: {rel}")
     data = fp.read_bytes()
-    if len(data) != spec["size"]:
+    expected_size = spec["size"]
+    if len(data) != expected_size:
         sys.exit(f"Size mismatch for {rel}")
     sha = hashlib.sha256(data).hexdigest()
-    if sha.lower() != spec["sha256"].lower():
+    expected_sha = spec["sha256"]
+    if sha.lower() != expected_sha.lower():
         sys.exit(f"Hash mismatch for {rel}")
-' "$GITHUB_WORKSPACE/static/web_client"
+    lines.append(f"{rel}:{expected_size}:{expected_sha}")
+
+expected_root = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+manifest_root = manifest.get("root_digest", "")
+if expected_root.lower() != manifest_root.lower():
+    sys.exit(f"Root digest mismatch: expected {expected_root}, got {manifest_root}")
+
+for root_dir, _, filenames in os.walk(root):
+    for fn in filenames:
+        p = Path(root_dir) / fn
+        rel_posix = p.relative_to(root).as_posix()
+        if rel_posix in (".source_revision", "web_client_manifest.json"):
+            continue
+        if rel_posix not in files:
+            sys.exit(f"Unmanifested file found in web client deployment: {rel_posix}")
+' "$GITHUB_WORKSPACE/static/web_client" "$EXPECTED_REVISION"
         if [[ -n "$(find "$GITHUB_WORKSPACE/static/web_client" -type l -print -quit)" ]]; then
           echo "Compiled Web runtime must not contain symbolic links" >&2
           exit 1

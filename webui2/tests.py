@@ -1,9 +1,11 @@
 import hashlib
 import json
 import re
+import shutil
+import subprocess
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
-from unittest import skipUnless
 
 from django.conf import settings
 from django.contrib.staticfiles import finders
@@ -158,14 +160,73 @@ class WebClientServerConfigurationTests(SimpleTestCase):
 
 
 class WebClientRuntimeTests(TestCase):
+    _created_runtime = False
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        runtime_dir = Path(settings.BASE_DIR) / "static" / "web_client"
+        if not (runtime_dir / ".source_revision").is_file():
+            cls._created_runtime = True
+            revision_script = Path(settings.BASE_DIR) / "scripts" / "web_client_revision.sh"
+            locked_rev = subprocess.check_output(["bash", str(revision_script)], text=True).strip()
+
+            with tempfile.TemporaryDirectory() as tmp_src:
+                src_path = Path(tmp_src)
+                (src_path / ".source_revision").write_text(f"{locked_rev} clean\n", encoding="utf-8")
+
+                files = {
+                    "flutter_bootstrap.js": (
+                        b'// flutter bootstrap mock\n'
+                        b'_flutter.buildConfig = {"builds":[{"compileTarget":"dart2js","renderer":"canvaskit","mainJsPath":"main.dart.js"}]};\n'
+                    ),
+                    "flutter.js": b'// flutter engine mock\n',
+                    "main.dart.js": b'// dart2js code\n',
+                    "manifest.json": b'{"name":"Camellia"}\n',
+                    "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
+                    "canvaskit/canvaskit.wasm": b'\x00asm\x01\x00\x00\x00mock-canvaskit',
+                    "js/dist/web_bridge.js": b'// web bridge mock\n',
+                    "js/dist/assets/video_worker-mock.js": b'// worker mock\n',
+                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b'// vp8 mock\n',
+                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b'\x00asm\x01\x00\x00\x00mock-vp8',
+                }
+                manifest_files = {}
+                for rel, data in files.items():
+                    fp = src_path / rel
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_bytes(data)
+                    manifest_files[rel] = {
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+
+                lines = [f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}" for k in sorted(manifest_files.keys())]
+                root_digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+                build_manifest = {
+                    "schema_version": 1,
+                    "source_revision": locked_rev,
+                    "source_state": "clean",
+                    "base_href": "/",
+                    "root_digest": root_digest,
+                    "files": manifest_files,
+                }
+                (src_path / "build_manifest.json").write_text(json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+                sync_script = Path(settings.BASE_DIR) / "sync_web_client.sh"
+                subprocess.run(["bash", str(sync_script), "--source", str(src_path)], check=True, capture_output=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._created_runtime:
+            runtime_dir = Path(settings.BASE_DIR) / "static" / "web_client"
+            if runtime_dir.is_dir():
+                shutil.rmtree(runtime_dir)
+        super().tearDownClass()
+
     @property
     def runtime_root(self):
         return Path(settings.BASE_DIR) / "static" / "web_client"
 
-    @skipUnless(
-        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
-        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
-    )
     def test_runtime_bundle_excludes_build_tooling(self):
         required_files = (
             ".source_revision",
@@ -196,10 +257,6 @@ class WebClientRuntimeTests(TestCase):
             with self.subTest(relative_path=relative_path):
                 self.assertFalse((self.runtime_root / relative_path).exists())
 
-    @skipUnless(
-        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
-        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
-    )
     def test_web_client_manifest_and_deployment_hardening(self):
         manifest_file = self.runtime_root / "web_client_manifest.json"
         self.assertTrue(manifest_file.is_file())
@@ -234,10 +291,6 @@ class WebClientRuntimeTests(TestCase):
         index_html = (self.runtime_root / "index.html").read_text(encoding="utf-8")
         self.assertIn('<base href="/static/web_client/">', index_html)
 
-    @skipUnless(
-        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
-        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
-    )
     def test_bootstrap_has_one_complete_javascript_target(self):
         bootstrap = (self.runtime_root / "flutter_bootstrap.js").read_text()
         match = re.search(r"_flutter\.buildConfig = (\{[^\n]+\});", bootstrap)
@@ -292,3 +345,105 @@ class WebClientRuntimeTests(TestCase):
         self.assertIn("'nonce-", csp)
         self.assertIn("'wasm-unsafe-eval'", csp)
         self.assertNotIn("'unsafe-eval'", csp)
+
+
+class WebClientManifestHardeningTests(SimpleTestCase):
+    def setUp(self):
+        super().setUp()
+        revision_script = Path(settings.BASE_DIR) / "scripts" / "web_client_revision.sh"
+        self.locked_rev = subprocess.check_output(["bash", str(revision_script)], text=True).strip()
+        self.sync_script = Path(settings.BASE_DIR) / "sync_web_client.sh"
+
+    def _create_mock_source(self, tmp_path, files=None, manifest_override=None, include_manifest=True):
+        src_path = Path(tmp_path)
+        (src_path / ".source_revision").write_text(f"{self.locked_rev} clean\n", encoding="utf-8")
+        if files is None:
+            files = {
+                "flutter_bootstrap.js": (
+                    b'// flutter bootstrap mock\n'
+                    b'_flutter.buildConfig = {"builds":[{"compileTarget":"dart2js","renderer":"canvaskit","mainJsPath":"main.dart.js"}]};\n'
+                ),
+                "flutter.js": b'// flutter engine mock\n',
+                "main.dart.js": b'// dart2js code\n',
+                "manifest.json": b'{"name":"Camellia"}\n',
+                "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
+                "canvaskit/canvaskit.wasm": b'\x00asm\x01\x00\x00\x00mock-canvaskit',
+                "js/dist/web_bridge.js": b'// web bridge mock\n',
+                "js/dist/assets/video_worker-mock.js": b'// worker mock\n',
+                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b'// vp8 mock\n',
+                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b'\x00asm\x01\x00\x00\x00mock-vp8',
+            }
+
+        manifest_files = {}
+        for rel, data in files.items():
+            fp = src_path / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(data)
+            manifest_files[rel] = {
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+
+        if include_manifest:
+            lines = [f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}" for k in sorted(manifest_files.keys())]
+            root_digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+            build_manifest = {
+                "schema_version": 1,
+                "source_revision": self.locked_rev,
+                "source_state": "clean",
+                "base_href": "/",
+                "root_digest": root_digest,
+                "files": manifest_files,
+            }
+            if manifest_override:
+                build_manifest.update(manifest_override)
+            (src_path / "build_manifest.json").write_text(json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        return src_path
+
+    def test_missing_build_manifest_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp, include_manifest=False)
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("missing build_manifest.json", res.stderr)
+
+    def test_tampered_file_size_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp)
+            (src / "main.dart.js").write_bytes(b'tampered-short')
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Size mismatch for main.dart.js", res.stderr)
+
+    def test_tampered_file_hash_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp)
+            original_len = len(b'// dart2js code\n')
+            (src / "main.dart.js").write_bytes(b'x' * original_len)
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Hash mismatch for main.dart.js", res.stderr)
+
+    def test_unmanifested_extra_file_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp)
+            (src / "unexpected_file.txt").write_bytes(b'unmanifested')
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Unmanifested file found in web client source: unexpected_file.txt", res.stderr)
+
+    def test_tampered_root_digest_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp, manifest_override={"root_digest": "0" * 64})
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("build_manifest root_digest mismatch", res.stderr)
+
+    def test_tampered_source_revision_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._create_mock_source(tmp, manifest_override={"source_revision": "1" * 40})
+            res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("build_manifest source_revision mismatch", res.stderr)
+

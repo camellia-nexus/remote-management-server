@@ -136,21 +136,44 @@ if [[ -n "$EXPECTED_REVISION" && "$SOURCE_REVISION" != "$EXPECTED_REVISION" ]]; 
   exit 1
 fi
 
-# If source contains build_manifest.json, verify its integrity before staging
-if [[ -f "${SRC}/build_manifest.json" ]]; then
-  python3 -c '
-import hashlib, json, sys
+# Require build_manifest.json and verify its full integrity before staging
+BUILD_MANIFEST_FILE="${SRC}/build_manifest.json"
+if [[ ! -f "$BUILD_MANIFEST_FILE" ]]; then
+  echo "Web client build is missing build_manifest.json: $BUILD_MANIFEST_FILE" >&2
+  exit 1
+fi
+
+python3 -c '
+import hashlib, json, os, sys
 from pathlib import Path
 
 src = Path(sys.argv[1])
+expected_rev = sys.argv[2]
 manifest_path = src / "build_manifest.json"
+
 with manifest_path.open("r", encoding="utf-8") as f:
     manifest = json.load(f)
 
-for rel, spec in manifest.get("files", {}).items():
+if manifest.get("schema_version") != 1:
+    sys.exit("Invalid build_manifest schema_version")
+
+actual_rev = manifest.get("source_revision")
+if actual_rev != expected_rev:
+    sys.exit(f"build_manifest source_revision mismatch: expected {expected_rev}, got {actual_rev}")
+
+actual_state = manifest.get("source_state")
+if actual_state != "clean":
+    sys.exit(f"build_manifest source_state is not clean: {actual_state}")
+
+files = manifest.get("files", {})
+if not files:
+    sys.exit("build_manifest contains no files")
+
+lines = []
+for rel, spec in sorted(files.items()):
     fp = src / rel
-    if not fp.is_file():
-        sys.exit(f"Missing file declared in build_manifest: {rel}")
+    if not fp.is_file() or fp.is_symlink():
+        sys.exit(f"Missing or invalid file declared in build_manifest: {rel}")
     data = fp.read_bytes()
     expected_size = spec["size"]
     if len(data) != expected_size:
@@ -159,8 +182,22 @@ for rel, spec in manifest.get("files", {}).items():
     expected_sha = spec["sha256"]
     if sha.lower() != expected_sha.lower():
         sys.exit(f"Hash mismatch for {rel}: expected {expected_sha}, got {sha}")
-' "$SRC"
-fi
+    lines.append(f"{rel}:{expected_size}:{expected_sha}")
+
+expected_root = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+manifest_root = manifest.get("root_digest", "")
+if expected_root.lower() != manifest_root.lower():
+    sys.exit(f"build_manifest root_digest mismatch: expected {expected_root}, got {manifest_root}")
+
+for root_dir, _, filenames in os.walk(src):
+    for fn in filenames:
+        p = Path(root_dir) / fn
+        rel_posix = p.relative_to(src).as_posix()
+        if rel_posix in (".source_revision", "build_manifest.json"):
+            continue
+        if rel_posix not in files:
+            sys.exit(f"Unmanifested file found in web client source: {rel_posix}")
+' "$SRC" "$LOCKED_REVISION"
 
 STAGING="$(mktemp -d "${STATIC_DIR}/.web-client-stage.XXXXXX")"
 BACKUP=""
