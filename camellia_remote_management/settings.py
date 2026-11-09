@@ -1125,6 +1125,7 @@ STATICFILES_DIRS = [BASE_DIR / "static"]
 # intended development mode explicit so tests do not scan an uncollected root.
 WHITENOISE_AUTOREFRESH = DEBUG
 WHITENOISE_USE_FINDERS = DEBUG
+WHITENOISE_INDEX_FILE = True
 STORAGES = {
     "default": {
         "BACKEND": "django.core.files.storage.FileSystemStorage",

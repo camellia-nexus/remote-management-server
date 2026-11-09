@@ -171,6 +171,7 @@ runs:
           manifest.json
           canvaskit/canvaskit.wasm
           js/dist/web_bridge.js
+          web_client_manifest.json
         )
         for required_file in "${required_files[@]}"; do
           if [[ ! -f "$GITHUB_WORKSPACE/static/web_client/$required_file" ]]; then
@@ -178,6 +179,41 @@ runs:
             exit 1
           fi
         done
+        shopt -s nullglob
+        worker_matches=("$GITHUB_WORKSPACE"/static/web_client/js/dist/assets/video_worker-*.js)
+        shopt -u nullglob
+        if [[ ${#worker_matches[@]} -eq 0 ]]; then
+          echo "Compiled Web runtime is missing video worker chunk in js/dist/assets/" >&2
+          exit 1
+        fi
+        if grep -Eq '["'\'']/js/dist/assets/video_worker' "$GITHUB_WORKSPACE/static/web_client/js/dist/web_bridge.js"; then
+          echo "Web bridge contains root-absolute video worker path /js/dist/assets/video_worker" >&2
+          exit 1
+        fi
+        if grep -Eq 'Object\.assign\(\{\}\)\[' "$GITHUB_WORKSPACE/static/web_client/js/dist/web_bridge.js"; then
+          echo "Web bridge contains empty Object.assign glob lookup for software decoders" >&2
+          exit 1
+        fi
+        python3 -c '
+import hashlib, json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest_path = root / "web_client_manifest.json"
+with manifest_path.open("r", encoding="utf-8") as f:
+    manifest = json.load(f)
+
+for rel, spec in manifest.get("files", {}).items():
+    fp = root / rel
+    if not fp.is_file():
+        sys.exit(f"Missing file declared in manifest: {rel}")
+    data = fp.read_bytes()
+    if len(data) != spec["size"]:
+        sys.exit(f"Size mismatch for {rel}")
+    sha = hashlib.sha256(data).hexdigest()
+    if sha.lower() != spec["sha256"].lower():
+        sys.exit(f"Hash mismatch for {rel}")
+' "$GITHUB_WORKSPACE/static/web_client"
         if [[ -n "$(find "$GITHUB_WORKSPACE/static/web_client" -type l -print -quit)" ]]; then
           echo "Compiled Web runtime must not contain symbolic links" >&2
           exit 1

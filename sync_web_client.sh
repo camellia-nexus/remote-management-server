@@ -4,18 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SRC_INPUT=""
 CLIENT_REPO_INPUT=""
+EXPECTED_ROOT_DIGEST=""
 LOCKED_REVISION="$("${SCRIPT_DIR}/scripts/web_client_revision.sh")"
 
 usage() {
   cat <<'EOF'
 Usage:
-  sync_web_client.sh --build-from CLIENT_REPOSITORY
-  sync_web_client.sh --source COMPILED_WEB_DIRECTORY
+  sync_web_client.sh --build-from CLIENT_REPOSITORY [--expected-root-digest DIGEST]
+  sync_web_client.sh --source COMPILED_WEB_DIRECTORY [--expected-root-digest DIGEST]
 
 Exactly one input mode is required. --build-from runs the client's canonical
 release build first; --source only synchronizes an already compiled, clean and
 revision-stamped build. Both modes require the source revision pinned by
-web-client.lock.
+web-client.lock and generate a verified web_client_manifest.json with root digest.
 EOF
 }
 
@@ -35,6 +36,14 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       SRC_INPUT="$2"
+      shift 2
+      ;;
+    --expected-root-digest)
+      if [[ $# -lt 2 ]]; then
+        echo "--expected-root-digest requires a sha256 digest" >&2
+        exit 2
+      fi
+      EXPECTED_ROOT_DIGEST="$2"
       shift 2
       ;;
     -h|--help)
@@ -80,7 +89,7 @@ if [[ -n "$CLIENT_REPO_INPUT" ]]; then
     exit 1
   fi
 
-  (cd "$CLIENT_REPO" && bash "$BUILD_SCRIPT" --mode release)
+  (cd "$CLIENT_REPO" && bash "$BUILD_SCRIPT" --mode release --base-href /static/web_client/)
 
   if [[ -n "$(git -C "$CLIENT_REPO" status --porcelain --untracked-files=no)" ]]; then
     echo "Client build modified tracked source files; refusing to synchronize ambiguous output." >&2
@@ -127,6 +136,32 @@ if [[ -n "$EXPECTED_REVISION" && "$SOURCE_REVISION" != "$EXPECTED_REVISION" ]]; 
   exit 1
 fi
 
+# If source contains build_manifest.json, verify its integrity before staging
+if [[ -f "${SRC}/build_manifest.json" ]]; then
+  python3 -c '
+import hashlib, json, sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+manifest_path = src / "build_manifest.json"
+with manifest_path.open("r", encoding="utf-8") as f:
+    manifest = json.load(f)
+
+for rel, spec in manifest.get("files", {}).items():
+    fp = src / rel
+    if not fp.is_file():
+        sys.exit(f"Missing file declared in build_manifest: {rel}")
+    data = fp.read_bytes()
+    expected_size = spec["size"]
+    if len(data) != expected_size:
+        sys.exit(f"Size mismatch for {rel}: expected {expected_size}, got {len(data)}")
+    sha = hashlib.sha256(data).hexdigest()
+    expected_sha = spec["sha256"]
+    if sha.lower() != expected_sha.lower():
+        sys.exit(f"Hash mismatch for {rel}: expected {expected_sha}, got {sha}")
+' "$SRC"
+fi
+
 STAGING="$(mktemp -d "${STATIC_DIR}/.web-client-stage.XXXXXX")"
 BACKUP=""
 
@@ -159,10 +194,16 @@ rm -rf -- \
   "$STAGING/js/package.json" \
   "$STAGING/js/package-lock.json" \
   "$STAGING/js/tsconfig.json" \
-  "$STAGING/js/vite.config.ts"
+  "$STAGING/js/vite.config.ts" \
+  "$STAGING/build_manifest.json"
 
 if [[ -f "$STAGING/assets/NOTICES" ]]; then
   sed -i 's/[[:blank:]]\+$//' "$STAGING/assets/NOTICES"
+fi
+
+# Ensure canonical base in index.html for Management deployment
+if [[ -f "$STAGING/index.html" ]]; then
+  sed -i 's|<base href="[^"]*">|<base href="/static/web_client/">|' "$STAGING/index.html"
 fi
 
 # Flutter embeds flutter.js into the bootstrap but leaves a source-map comment
@@ -190,6 +231,74 @@ for required_file in "${required_files[@]}"; do
     exit 1
   fi
 done
+
+# Verify video worker chunk exists
+shopt -s nullglob
+worker_matches=("$STAGING"/js/dist/assets/video_worker-*.js)
+shopt -u nullglob
+if [[ ${#worker_matches[@]} -eq 0 ]]; then
+  echo "Incomplete web client build; missing video worker in js/dist/assets/" >&2
+  exit 1
+fi
+
+# Verify no absolute /js/dist/ paths or undefined requests in bundle
+if grep -Eq '["'\'']/js/dist/assets/video_worker' "$STAGING/js/dist/web_bridge.js"; then
+  echo "Web bridge contains root-absolute video worker path /js/dist/assets/video_worker; expected relative import.meta.url resolution" >&2
+  exit 1
+fi
+if grep -Eq 'Object\.assign\(\{\}\)\[' "$STAGING/js/dist/web_bridge.js"; then
+  echo "Web bridge contains empty Object.assign glob lookup for software decoders" >&2
+  exit 1
+fi
+
+# Generate canonical deployment manifest for the sanitized deployment tree
+python3 -c '
+import hashlib, json, os, sys
+from pathlib import Path
+
+staging = Path(sys.argv[1])
+revision = sys.argv[2]
+expected_digest = sys.argv[3]
+
+files = {}
+for root, _, filenames in os.walk(staging):
+    for fn in filenames:
+        fp = Path(root) / fn
+        rel = fp.relative_to(staging).as_posix()
+        if rel in (".source_revision", "web_client_manifest.json"):
+            continue
+        data = fp.read_bytes()
+        files[rel] = {
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()
+        }
+
+sorted_files = sorted(files.keys())
+lines = [k + ":" + str(files[k]["size"]) + ":" + files[k]["sha256"] for k in sorted_files]
+root_digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+if expected_digest and root_digest.lower() != expected_digest.lower():
+    sys.exit(f"Web client root digest mismatch: expected {expected_digest}, got {root_digest}")
+
+manifest = {
+    "schema_version": 1,
+    "source_revision": revision,
+    "root_digest": root_digest,
+    "files": files
+}
+
+manifest_file = staging / "web_client_manifest.json"
+with manifest_file.open("w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write("\n")
+
+print(f"Generated web_client_manifest.json (root_digest={root_digest})")
+' "$STAGING" "$SOURCE_REVISION" "$EXPECTED_ROOT_DIGEST"
+
+if [[ ! -f "$STAGING/web_client_manifest.json" ]]; then
+  echo "Failed to generate web_client_manifest.json" >&2
+  exit 1
+fi
 
 if [[ -d "$DST" ]]; then
   BACKUP="$(mktemp -d "${STATIC_DIR}/.web-client-backup.XXXXXX")"

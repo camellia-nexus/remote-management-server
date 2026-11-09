@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from html.parser import HTMLParser
@@ -173,6 +174,7 @@ class WebClientRuntimeTests(TestCase):
             "manifest.json",
             "canvaskit/canvaskit.wasm",
             "js/dist/web_bridge.js",
+            "web_client_manifest.json",
         )
         for relative_path in required_files:
             with self.subTest(relative_path=relative_path):
@@ -193,6 +195,44 @@ class WebClientRuntimeTests(TestCase):
         for relative_path in forbidden_paths:
             with self.subTest(relative_path=relative_path):
                 self.assertFalse((self.runtime_root / relative_path).exists())
+
+    @skipUnless(
+        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
+        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
+    )
+    def test_web_client_manifest_and_deployment_hardening(self):
+        manifest_file = self.runtime_root / "web_client_manifest.json"
+        self.assertTrue(manifest_file.is_file())
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("schema_version"), 1)
+        self.assertIn("root_digest", manifest)
+        self.assertRegex(manifest["root_digest"], r"^[0-9a-f]{64}$")
+        self.assertIsInstance(manifest.get("files"), dict)
+
+        lines = []
+        for rel_path, spec in sorted(manifest["files"].items()):
+            file_path = self.runtime_root / rel_path
+            self.assertTrue(file_path.is_file(), f"Manifest file missing: {rel_path}")
+            data = file_path.read_bytes()
+            self.assertEqual(len(data), spec["size"], f"Size mismatch for {rel_path}")
+            self.assertEqual(
+                hashlib.sha256(data).hexdigest().lower(),
+                spec["sha256"].lower(),
+                f"Hash mismatch for {rel_path}",
+            )
+            lines.append(f"{rel_path}:{spec['size']}:{spec['sha256']}")
+        expected_root = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+        self.assertEqual(expected_root, manifest["root_digest"])
+
+        worker_matches = list((self.runtime_root / "js" / "dist" / "assets").glob("video_worker-*.js"))
+        self.assertTrue(len(worker_matches) >= 1, "Expected video_worker-*.js chunk in js/dist/assets")
+
+        web_bridge = (self.runtime_root / "js" / "dist" / "web_bridge.js").read_text(encoding="utf-8")
+        self.assertNotRegex(web_bridge, r"""["']/js/dist/assets/video_worker""")
+        self.assertNotIn("Object.assign({})[", web_bridge)
+
+        index_html = (self.runtime_root / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<base href="/static/web_client/">', index_html)
 
     @skipUnless(
         (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),

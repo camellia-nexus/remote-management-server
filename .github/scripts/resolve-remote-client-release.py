@@ -234,6 +234,13 @@ def resolve(args: argparse.Namespace) -> dict[str, Any]:
         version=version,
         commit=args.commit,
     )
+    web_file = [
+        item
+        for item in evidence.get("files", [])
+        if item.get("platform") == "web"
+        and item.get("architecture") == "universal"
+        and item.get("name", "").endswith(".zip")
+    ][0]
     return {
         "target_repository": target_repository,
         "release": release,
@@ -242,6 +249,7 @@ def resolve(args: argparse.Namespace) -> dict[str, Any]:
         "version": version,
         "tag": tag,
         "commit": args.commit,
+        "web_file": web_file,
     }
 
 
@@ -254,6 +262,7 @@ def write_outputs(args: argparse.Namespace, resolved: dict[str, Any]) -> None:
     dependencies_path = output / "dependencies.json"
     evidence_path.write_bytes(resolved["evidence_bytes"])
     evidence_sha = hashlib.sha256(resolved["evidence_bytes"]).hexdigest()
+    web_file = resolved.get("web_file")
     metadata = {
         "schema_version": 1,
         "repository": "remote-client",
@@ -268,6 +277,11 @@ def write_outputs(args: argparse.Namespace, resolved: dict[str, Any]) -> None:
             "sha256": evidence_sha,
         },
     }
+    if web_file is not None:
+        metadata["web_artifact"] = {
+            "name": web_file["name"],
+            "sha256": web_file["sha256"],
+        }
     dependency = {
         "repository": "remote-client",
         "commit": resolved["commit"],
@@ -289,6 +303,10 @@ def write_outputs(args: argparse.Namespace, resolved: dict[str, Any]) -> None:
             stream.write(f"repository={resolved['target_repository']}\n")
             stream.write(f"tag={resolved['tag']}\n")
             stream.write(f"version={resolved['version']}\n")
+            stream.write(f"release_evidence_sha256={evidence_sha}\n")
+            if web_file is not None:
+                stream.write(f"web_artifact_name={web_file['name']}\n")
+                stream.write(f"web_artifact_sha256={web_file['sha256']}\n")
 
 
 def parser() -> argparse.ArgumentParser:

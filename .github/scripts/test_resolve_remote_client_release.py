@@ -148,13 +148,16 @@ class ResolveRemoteClientReleaseTests(unittest.TestCase):
                     }
                 raise AssertionError(arguments)
 
+            github_output_file = root / "github_output.txt"
+            args = self.args(root)
+            args.github_output = github_output_file
             payload = (json.dumps(release_evidence()) + "\n").encode()
             with (
                 patch.object(resolver, "run_gh_json", side_effect=gh_json),
                 patch.object(resolver, "run_gh_bytes", return_value=payload),
             ):
-                resolved = resolver.resolve(self.args(root))
-                resolver.write_outputs(self.args(root), resolved)
+                resolved = resolver.resolve(args)
+                resolver.write_outputs(args, resolved)
 
             dependency = json.loads(
                 (root / "dependencies.json").read_text()
@@ -165,7 +168,14 @@ class ResolveRemoteClientReleaseTests(unittest.TestCase):
             self.assertEqual(dependency["commit"], COMMIT)
             self.assertEqual(dependency["relation"], "bundles")
             self.assertEqual(metadata["version"], "1.2.3")
+            self.assertEqual(metadata["web_artifact"]["name"], "client-web.zip")
+            self.assertEqual(metadata["web_artifact"]["sha256"], "c" * 64)
             self.assertNotIn("example/desktop", json.dumps(metadata))
+
+            output_text = github_output_file.read_text(encoding="utf-8")
+            self.assertIn(f"commit={COMMIT}", output_text)
+            self.assertIn("web_artifact_name=client-web.zip", output_text)
+            self.assertIn(f"web_artifact_sha256={'c' * 64}", output_text)
 
     def test_rejects_incomplete_locked_release(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly one"):
