@@ -97,10 +97,10 @@ def _format_host_port(host: str, port: int) -> str:
 def _parse_server_input(server: str) -> _ServerEndpoint | None:
     if not server or len(server) > 2048:
         return None
-    if any((ord(c) < 32 and c not in " \t\r\n") or ord(c) == 127 for c in server):
+    if any((ord(c) < 32 and c not in " \t\r\n") or ord(c) == 127 or (128 <= ord(c) <= 159) for c in server):
         return None
     server = server.strip()
-    if not server or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in server):
+    if not server or any(character.isspace() or ord(character) < 32 or ord(character) == 127 or (128 <= ord(character) <= 159) for character in server):
         return None
     if "#" in server:
         return None

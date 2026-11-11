@@ -182,6 +182,14 @@ class WebClientServerConfigurationTests(SimpleTestCase):
             "",
         )
         self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom\x80id"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom\x9fid"),
+            "",
+        )
+        self.assertEqual(
             _normalize_rendezvous_server("wss://id.example.com/custom id"),
             "",
         )
