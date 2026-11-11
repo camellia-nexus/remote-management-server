@@ -154,7 +154,51 @@ class WebClientServerConfigurationTests(SimpleTestCase):
             "",
         )
         self.assertEqual(
+            _normalize_rendezvous_server("wss://user@id.example.com"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://@id.example.com"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com#fragment"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com#"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom\x00id"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom\x1fid"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom\x7fid"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_rendezvous_server("wss://id.example.com/custom id"),
+            "",
+        )
+        self.assertEqual(
             _normalize_relay_server("relay.example.com/path"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_relay_server("user@relay.example.com"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_relay_server("relay.example.com?query"),
+            "",
+        )
+        self.assertEqual(
+            _normalize_relay_server("relay.example.com#frag"),
             "",
         )
 

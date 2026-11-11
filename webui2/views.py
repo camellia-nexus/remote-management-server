@@ -81,8 +81,9 @@ def _format_ws_endpoint(
     suffix = path if path and path != "/" else ""
     if suffix and not suffix.startswith("/"):
         suffix = f"/{suffix}"
-    if query:
-        suffix = f"{suffix}?{query}"
+    clean_query = query[1:] if query.startswith("?") else query
+    if clean_query:
+        suffix = f"{suffix}?{clean_query}"
     return f"{scheme}://{host}:{port}{suffix}"
 
 
@@ -94,8 +95,14 @@ def _format_host_port(host: str, port: int) -> str:
 
 
 def _parse_server_input(server: str) -> _ServerEndpoint | None:
-    server = (server or "").strip()
-    if not server or len(server) > 2048 or any(character.isspace() for character in server):
+    if not server or len(server) > 2048:
+        return None
+    if any((ord(c) < 32 and c not in " \t\r\n") or ord(c) == 127 for c in server):
+        return None
+    server = server.strip()
+    if not server or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in server):
+        return None
+    if "#" in server:
         return None
     if "://" in server:
         try:
@@ -103,13 +110,15 @@ def _parse_server_input(server: str) -> _ServerEndpoint | None:
             scheme = (parsed.scheme or "").lower()
             if scheme not in ("ws", "wss"):
                 return None
-            if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
                 return None
             host = (parsed.hostname or "").strip()
             if not host:
                 return None
             try:
                 port = parsed.port
+                if port is not None and (port <= 0 or port > 65535):
+                    return None
             except ValueError:
                 return None
             host = _strip_ipv6_brackets(host)
@@ -122,7 +131,7 @@ def _parse_server_input(server: str) -> _ServerEndpoint | None:
             )
         except ValueError:
             return None
-    if any(character in server for character in "/?#"):
+    if any(character in server for character in "/?#@"):
         return None
     if server.startswith("["):
         end = server.find("]")
@@ -201,6 +210,8 @@ def _derive_relay_server(rendezvous_endpoint: str) -> str:
         "ws",
         parsed.host,
         _offset_port(websocket_port, 1),
+        parsed.path,
+        parsed.query,
     )
 
 
