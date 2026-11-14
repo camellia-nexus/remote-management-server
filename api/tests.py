@@ -28,6 +28,7 @@ from api.formatting import format_bytes
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
+    AddressBookShare,
     AlarmLog,
     ConnLog,
     DataEncryptionKeyState,
@@ -2807,3 +2808,193 @@ class DataEncryptionRotationTests(TestCase):
             call_command("rotate_data_encryption", dry_run=True, stdout=output)
 
         self.assertEqual(json.loads(output.getvalue())["remaining"], 1)
+
+
+STATIC_TEST_STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}
+
+
+@override_settings(STORAGES=STATIC_TEST_STORAGES)
+class AddressBookQueryOptimizationTests(ApiTestMixin, TestCase):
+    """
+    PERF-007: Address book query count assertions ensuring constant O(1)
+    queries regardless of profile count (tested at 1, 25, and 50 profiles).
+    """
+
+    def _create_profiles_with_peers_and_tags(self, count, owner=None):
+        target_owner = owner or self.user
+        created = []
+        for i in range(count):
+            guid = f"perf-profile-{uuid.uuid4().hex[:12]}-{i}"
+            profile = AddressBookProfile.objects.create(
+                guid=guid,
+                name=f"Profile {i:03d}",
+                owner=target_owner,
+                rule=1,
+            )
+            RemotePeer.objects.create(
+                profile=profile,
+                rid=f"rid{i:05d}",
+                alias=f"Peer {i}",
+            )
+            RemoteTag.objects.create(
+                profile=profile,
+                tag_name=f"Tag {i}",
+                tag_color="#397bff",
+            )
+            created.append(profile)
+        return created
+
+    def _filter_ab_queries(self, captured):
+        return [
+            q
+            for q in captured.captured_queries
+            if any(tbl in q["sql"].lower() for tbl in ("api_addressbook", "api_remotepeer", "api_remotetag"))
+        ]
+
+    def test_ab_shared_profiles_query_count_is_constant_o1(self):
+        token = self._login(
+            "alice",
+            "alice-pass",
+            rid="888000001",
+            uuid=device_uuid("alice-device-perf"),
+        )
+        counts = [1, 25, 50]
+        total_query_counts = []
+        ab_query_counts = []
+
+        for count in counts:
+            AddressBookProfile.objects.exclude(guid__startswith="personal-").delete()
+            self._create_profiles_with_peers_and_tags(count, owner=self.user)
+
+            with CaptureQueriesContext(connection) as captured:
+                response = self._post_json(
+                    "/api/ab/shared/profiles?current=1&pageSize=10",
+                    {},
+                    token=token,
+                )
+            self.assertEqual(response.status_code, 200, response.content)
+            body = response.json()
+            self.assertEqual(body["total"], count)
+            self.assertEqual(len(body["data"]), min(10, count))
+
+            ab_queries = self._filter_ab_queries(captured)
+            ab_query_counts.append(len(ab_queries))
+            total_query_counts.append(len(captured.captured_queries))
+            self.assertLessEqual(len(ab_queries), 2)
+
+        # Query counts must remain strictly constant O(1) across 1, 25, 50 profiles
+        self.assertEqual(ab_query_counts[0], ab_query_counts[1])
+        self.assertEqual(ab_query_counts[1], ab_query_counts[2])
+        self.assertEqual(total_query_counts[0], total_query_counts[1])
+        self.assertEqual(total_query_counts[1], total_query_counts[2])
+
+    def test_ab_shared_profiles_shared_books_query_count_is_constant_o1(self):
+        other_user = UserProfile.objects.create_user(
+            username="charlie",
+            password="charlie-pass",
+            email="charlie@example.test",
+        )
+        token = self._login(
+            "alice",
+            "alice-pass",
+            rid="888000002",
+            uuid=device_uuid("alice-device-perf2"),
+        )
+        counts = [1, 25, 50]
+        total_query_counts = []
+        ab_query_counts = []
+
+        for count in counts:
+            AddressBookProfile.objects.exclude(guid__startswith="personal-").delete()
+            profiles = self._create_profiles_with_peers_and_tags(count, owner=other_user)
+            for p in profiles:
+                AddressBookShare.objects.create(profile=p, user=self.user, rule=2)
+
+            with CaptureQueriesContext(connection) as captured:
+                response = self._post_json(
+                    "/api/ab/shared/profiles?current=1&pageSize=10",
+                    {},
+                    token=token,
+                )
+            self.assertEqual(response.status_code, 200, response.content)
+            body = response.json()
+            self.assertEqual(body["total"], count)
+            self.assertEqual(len(body["data"]), min(10, count))
+
+            ab_queries = self._filter_ab_queries(captured)
+            ab_query_counts.append(len(ab_queries))
+            total_query_counts.append(len(captured.captured_queries))
+            # 1 count query + 1 page query + 1 share query + 1 rule query = 4 queries max
+            self.assertLessEqual(len(ab_queries), 4)
+
+        # Query counts must remain strictly constant O(1) across 1, 25, 50 profiles
+        self.assertEqual(ab_query_counts[0], ab_query_counts[1])
+        self.assertEqual(ab_query_counts[1], ab_query_counts[2])
+        self.assertEqual(total_query_counts[0], total_query_counts[1])
+        self.assertEqual(total_query_counts[1], total_query_counts[2])
+
+    def test_front_ab_books_view_query_count_is_constant_o1(self):
+        self.client.force_login(self.user)
+        counts = [1, 25, 50]
+        total_query_counts = []
+        ab_query_counts = []
+
+        for count in counts:
+            AddressBookProfile.objects.exclude(guid__startswith="personal-").delete()
+            self._create_profiles_with_peers_and_tags(count, owner=self.user)
+
+            with CaptureQueriesContext(connection) as captured:
+                response = self.client.get("/api/ab_books")
+            self.assertEqual(response.status_code, 200)
+
+            ab_queries = self._filter_ab_queries(captured)
+            ab_query_counts.append(len(ab_queries))
+            total_query_counts.append(len(captured.captured_queries))
+            # Accessible profiles evaluation + annotated peer/tag counts = 3 queries max
+            self.assertLessEqual(len(ab_queries), 3)
+
+        # Query counts must remain strictly constant O(1) across 1, 25, 50 profiles
+        self.assertEqual(ab_query_counts[0], ab_query_counts[1])
+        self.assertEqual(ab_query_counts[1], ab_query_counts[2])
+        self.assertEqual(total_query_counts[0], total_query_counts[1])
+        self.assertEqual(total_query_counts[1], total_query_counts[2])
+
+    def test_front_ab_books_view_shared_profiles_query_count_is_constant_o1(self):
+        other_user = UserProfile.objects.create_user(
+            username="david",
+            password="david-pass",
+            email="david@example.test",
+        )
+        self.client.force_login(self.user)
+        counts = [1, 25, 50]
+        total_query_counts = []
+        ab_query_counts = []
+
+        for count in counts:
+            AddressBookProfile.objects.exclude(guid__startswith="personal-").delete()
+            profiles = self._create_profiles_with_peers_and_tags(count, owner=other_user)
+            for p in profiles:
+                AddressBookShare.objects.create(profile=p, user=self.user, rule=2)
+
+            with CaptureQueriesContext(connection) as captured:
+                response = self.client.get("/api/ab_books")
+            self.assertEqual(response.status_code, 200)
+
+            ab_queries = self._filter_ab_queries(captured)
+            ab_query_counts.append(len(ab_queries))
+            total_query_counts.append(len(captured.captured_queries))
+            # Accessible profiles evaluation + batched shares/rules = 5 queries max
+            self.assertLessEqual(len(ab_queries), 5)
+
+        # Query counts must remain strictly constant O(1) across 1, 25, 50 profiles
+        self.assertEqual(ab_query_counts[0], ab_query_counts[1])
+        self.assertEqual(ab_query_counts[1], ab_query_counts[2])
+        self.assertEqual(total_query_counts[0], total_query_counts[1])
+        self.assertEqual(total_query_counts[1], total_query_counts[2])

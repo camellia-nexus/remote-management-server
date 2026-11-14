@@ -25,7 +25,7 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, connection, transaction
-from django.db.models import F, Prefetch, Q, QuerySet
+from django.db.models import Count, F, Prefetch, Q, QuerySet
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
@@ -2991,50 +2991,68 @@ def ab_shared_profiles(request):
     pagination, error_response = _pagination_or_error(request)
     if error_response:
         return error_response
-    items = {}
 
-    def add_profile(p, rule_value):
-        if not p or _is_personal_guid(p.guid):
-            return
-        info = _public_profile_info(p.info)
-        owner_name = p.owner.username if p.owner else ""
-        existing = items.get(p.guid)
-        rule_value = int(rule_value or 0)
-        if existing:
-            if rule_value > existing.get("rule", 0):
-                existing["rule"] = rule_value
-            return
-        items[p.guid] = {
-            **_address_book_snapshot(p),
-            "name": p.name,
-            "owner": owner_name,
-            "note": p.note,
-            "info": info,
-            "rule": rule_value,
-        }
+    base_qs = AddressBookProfile.objects.defer("default_password").exclude(guid__startswith="personal-")
 
+    group_ids = []
     if user.is_admin:
-        for p in AddressBookProfile.objects.defer("default_password").all():
-            add_profile(p, 3)
+        qs = base_qs
     else:
-        for p in AddressBookProfile.objects.defer("default_password").filter(Q(owner=user)):
-            add_profile(p, 3)
-        for share in (
-            AddressBookShare.objects.filter(Q(user=user))
-            .select_related("profile", "profile__owner")
-            .defer("profile__default_password")
-        ):
-            add_profile(share.profile, share.rule)
         group_ids = list(user.groups.values_list("id", flat=True))
-        rules_qs = AddressBookRule.objects.filter(Q(is_everyone=True))
+        rule_filter = Q(is_everyone=True) | Q(user=user)
         if group_ids:
-            rules_qs = rules_qs | AddressBookRule.objects.filter(Q(group_id__in=group_ids))
-        rules_qs = rules_qs | AddressBookRule.objects.filter(Q(user=user))
-        for r in rules_qs.select_related("profile", "profile__owner").defer("profile__default_password"):
-            add_profile(r.profile, r.rule)
-    data = list(items.values())
-    data.sort(key=lambda x: (x["name"], x["guid"]))
-    total = len(data)
+            rule_filter |= Q(group_id__in=group_ids)
+        rule_ids = AddressBookRule.objects.filter(rule_filter).values("profile_id")
+        share_ids = AddressBookShare.objects.filter(user=user).values("profile_id")
+        accessible_filter = Q(owner=user) | Q(id__in=rule_ids) | Q(id__in=share_ids)
+        qs = base_qs.filter(accessible_filter).distinct()
+
+    total = qs.count()
+
+    page_profiles = list(
+        qs.select_related("owner")
+        .annotate(
+            peers_count=Count("peers", distinct=True),
+            tags_count=Count("tags", distinct=True),
+        )
+        .order_by("name", "guid")[pagination.start : pagination.end]
+    )
+
+    rules_map = {}
+    if not user.is_admin:
+        non_owned_ids = [p.id for p in page_profiles if str(p.owner_id) != str(user.id)]
+        if non_owned_ids:
+            for s in AddressBookShare.objects.filter(user=user, profile_id__in=non_owned_ids).values(
+                "profile_id", "rule"
+            ):
+                pid = s["profile_id"]
+                rules_map[pid] = max(rules_map.get(pid, 0), int(s["rule"] or 0))
+            rule_filter = Q(is_everyone=True) | Q(user=user)
+            if group_ids:
+                rule_filter |= Q(group_id__in=group_ids)
+            for r in AddressBookRule.objects.filter(rule_filter, profile_id__in=non_owned_ids).values(
+                "profile_id", "rule"
+            ):
+                pid = r["profile_id"]
+                rules_map[pid] = max(rules_map.get(pid, 0), int(r["rule"] or 0))
+
+    data = []
+    for p in page_profiles:
+        if user.is_admin or str(p.owner_id) == str(user.id):
+            rule_value = 3
+        else:
+            rule_value = rules_map.get(p.id, 0)
+        data.append(
+            {
+                **_address_book_snapshot(p),
+                "name": p.name,
+                "owner": p.owner.username if p.owner else "",
+                "note": p.note,
+                "info": _public_profile_info(p.info),
+                "rule": rule_value,
+            }
+        )
+
     _log_event(
         request,
         "api_ab_shared_profiles",
@@ -3049,7 +3067,7 @@ def ab_shared_profiles(request):
             "address_book_snapshot_version": 1,
             "total": total,
             **_pagination_response_fields(pagination),
-            "data": data[pagination.start : pagination.end],
+            "data": data,
         }
     )
 

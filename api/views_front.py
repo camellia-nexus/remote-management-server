@@ -2313,14 +2313,43 @@ def ab_books(request):
             messages.success(request, _("地址簿已更新。"))
             return HttpResponseRedirect("/api/ab_books")
 
-    profiles_qs = _ab_accessible_profiles(u, filter_q)
+    profiles_qs = (
+        _ab_accessible_profiles(u, filter_q)
+        .annotate(
+            peers_count=Count("peers", distinct=True),
+            tags_count=Count("tags", distinct=True),
+        )
+        .order_by("name")
+    )
+    profiles_list = list(profiles_qs)
+
+    access_rules = {}
+    if not u.is_admin:
+        non_owned_ids = [p.id for p in profiles_list if str(p.owner_id) != str(u.id)]
+        if non_owned_ids:
+            group_ids = list(u.groups.values_list("id", flat=True))
+            rule_filter = Q(is_everyone=True) | Q(user=u)
+            if group_ids:
+                rule_filter |= Q(group_id__in=group_ids)
+            shares_qs = AddressBookShare.objects.filter(user=u, profile_id__in=non_owned_ids).values(
+                "profile_id", "rule"
+            )
+            rules_qs = AddressBookRule.objects.filter(rule_filter, profile_id__in=non_owned_ids).values(
+                "profile_id", "rule"
+            )
+            for s in shares_qs:
+                pid = s["profile_id"]
+                access_rules[pid] = max(access_rules.get(pid, 0), int(s["rule"] or 0))
+            for r in rules_qs:
+                pid = r["profile_id"]
+                access_rules[pid] = max(access_rules.get(pid, 0), int(r["rule"] or 0))
 
     profiles = []
-    for profile in profiles_qs.order_by("name"):
+    for profile in profiles_list:
         is_personal = _is_personal_guid(profile.guid)
-        peers_count = profile.peers.count()
-        tags_count = profile.tags.count()
-        access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else _get_rule_access(profile, u)
+        peers_count = getattr(profile, "peers_count", 0)
+        tags_count = getattr(profile, "tags_count", 0)
+        access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else access_rules.get(profile.id, 0)
         can_edit = u.is_admin or str(profile.owner_id) == str(u.id) or _can_write_rule(access_rule)
         profiles.append(
             {
