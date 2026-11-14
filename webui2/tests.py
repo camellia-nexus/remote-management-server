@@ -10,6 +10,7 @@ from pathlib import Path
 from django.conf import settings
 from django.contrib.staticfiles import finders
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils.csp import CSP
 
 from api.models import UserProfile
 from webui2.views import (
@@ -229,18 +230,18 @@ class WebClientRuntimeTests(TestCase):
 
                 files = {
                     "flutter_bootstrap.js": (
-                        b'// flutter bootstrap mock\n'
+                        b"// flutter bootstrap mock\n"
                         b'_flutter.buildConfig = {"builds":[{"compileTarget":"dart2js","renderer":"canvaskit","mainJsPath":"main.dart.js"}]};\n'
                     ),
-                    "flutter.js": b'// flutter engine mock\n',
-                    "main.dart.js": b'// dart2js code\n',
+                    "flutter.js": b"// flutter engine mock\n",
+                    "main.dart.js": b"// dart2js code\n",
                     "manifest.json": b'{"name":"Camellia"}\n',
                     "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
-                    "canvaskit/canvaskit.wasm": b'\x00asm\x01\x00\x00\x00mock-canvaskit',
-                    "js/dist/web_bridge.js": b'// web bridge mock\n',
-                    "js/dist/assets/video_worker-mock.js": b'// worker mock\n',
-                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b'// vp8 mock\n',
-                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b'\x00asm\x01\x00\x00\x00mock-vp8',
+                    "canvaskit/canvaskit.wasm": b"\x00asm\x01\x00\x00\x00mock-canvaskit",
+                    "js/dist/web_bridge.js": b"// web bridge mock\n",
+                    "js/dist/assets/video_worker-mock.js": b"// worker mock\n",
+                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b"// vp8 mock\n",
+                    "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b"\x00asm\x01\x00\x00\x00mock-vp8",
                 }
                 manifest_files = {}
                 for rel, data in files.items():
@@ -252,7 +253,10 @@ class WebClientRuntimeTests(TestCase):
                         "sha256": hashlib.sha256(data).hexdigest(),
                     }
 
-                lines = [f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}" for k in sorted(manifest_files.keys())]
+                lines = [
+                    f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}"
+                    for k in sorted(manifest_files.keys())
+                ]
                 root_digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
                 build_manifest = {
                     "schema_version": 1,
@@ -262,7 +266,9 @@ class WebClientRuntimeTests(TestCase):
                     "root_digest": root_digest,
                     "files": manifest_files,
                 }
-                (src_path / "build_manifest.json").write_text(json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                (src_path / "build_manifest.json").write_text(
+                    json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
 
                 sync_script = Path(settings.BASE_DIR) / "sync_web_client.sh"
                 subprocess.run(["bash", str(sync_script), "--source", str(src_path)], check=True, capture_output=True)
@@ -397,6 +403,77 @@ class WebClientRuntimeTests(TestCase):
         self.assertIn("'nonce-", csp)
         self.assertIn("'wasm-unsafe-eval'", csp)
         self.assertNotIn("'unsafe-eval'", csp)
+        directives = {d.strip().split()[0]: d.strip().split()[1:] for d in csp.split(";") if d.strip()}
+        script_src = directives.get("script-src", [])
+        self.assertIn("'self'", script_src)
+        self.assertNotIn("'unsafe-inline'", script_src)
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
+    def test_web_index_disallows_unsafe_inline_and_verifies_all_scripts(self):
+        user = UserProfile.objects.create_user(
+            username="web-client-csp-user",
+            password="test-password",
+        )
+        self.client.force_login(user)
+
+        response = self.client.get("/webui2/")
+        self.assertEqual(response.status_code, 200)
+
+        csp = response.headers.get("Content-Security-Policy", "")
+        directives = {d.strip().split()[0]: d.strip().split()[1:] for d in csp.split(";") if d.strip()}
+        script_src = directives.get("script-src", [])
+        self.assertIn("'self'", script_src)
+        self.assertNotIn("'unsafe-inline'", script_src)
+
+        nonces = [item[7:-1] for item in script_src if item.startswith("'nonce-") and item.endswith("'")]
+        self.assertEqual(len(nonces), 1)
+        expected_nonce = nonces[0]
+
+        html = response.content.decode("utf-8")
+        script_pattern = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.DOTALL | re.IGNORECASE)
+        scripts_found = 0
+        for match in script_pattern.finditer(html):
+            scripts_found += 1
+            attrs_str = match.group(1)
+            body = match.group(2).strip()
+            if body:
+                nonce_match = re.search(r'nonce=["\']([^"\']+)["\']', attrs_str)
+                self.assertIsNotNone(
+                    nonce_match,
+                    f"Found inline script without nonce under strict CSP: {body[:100]}",
+                )
+                self.assertEqual(
+                    nonce_match.group(1),
+                    expected_nonce,
+                    "Inline script nonce does not match CSP header nonce",
+                )
+            else:
+                src_match = re.search(r'src=["\']([^"\']+)["\']', attrs_str)
+                self.assertIsNotNone(
+                    src_match,
+                    f"Script tag has neither body nor src attribute: {attrs_str}",
+                )
+        self.assertGreater(scripts_found, 0)
+
+    def test_externalized_bootstrap_script_passes_csp_verification(self):
+        csp_config = settings.SECURE_CSP
+        self.assertIn("script-src", csp_config)
+        script_src_policy = csp_config["script-src"]
+
+        self.assertIn(CSP.SELF, script_src_policy)
+        self.assertNotIn(CSP.UNSAFE_INLINE, script_src_policy)
+        self.assertNotIn("'unsafe-inline'", script_src_policy)
+
+        # Externalized bootstrap scripts (e.g. static/web_client/bootstrap.js)
+        # load from 'self' origin without requiring unsafe-inline.
+        self.assertTrue(
+            all(source != CSP.UNSAFE_INLINE and source != "'unsafe-inline'" for source in script_src_policy)
+        )
 
 
 class WebClientManifestHardeningTests(SimpleTestCase):
@@ -412,18 +489,18 @@ class WebClientManifestHardeningTests(SimpleTestCase):
         if files is None:
             files = {
                 "flutter_bootstrap.js": (
-                    b'// flutter bootstrap mock\n'
+                    b"// flutter bootstrap mock\n"
                     b'_flutter.buildConfig = {"builds":[{"compileTarget":"dart2js","renderer":"canvaskit","mainJsPath":"main.dart.js"}]};\n'
                 ),
-                "flutter.js": b'// flutter engine mock\n',
-                "main.dart.js": b'// dart2js code\n',
+                "flutter.js": b"// flutter engine mock\n",
+                "main.dart.js": b"// dart2js code\n",
                 "manifest.json": b'{"name":"Camellia"}\n',
                 "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
-                "canvaskit/canvaskit.wasm": b'\x00asm\x01\x00\x00\x00mock-canvaskit',
-                "js/dist/web_bridge.js": b'// web bridge mock\n',
-                "js/dist/assets/video_worker-mock.js": b'// worker mock\n',
-                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b'// vp8 mock\n',
-                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b'\x00asm\x01\x00\x00\x00mock-vp8',
+                "canvaskit/canvaskit.wasm": b"\x00asm\x01\x00\x00\x00mock-canvaskit",
+                "js/dist/web_bridge.js": b"// web bridge mock\n",
+                "js/dist/assets/video_worker-mock.js": b"// worker mock\n",
+                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b"// vp8 mock\n",
+                "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.wasm": b"\x00asm\x01\x00\x00\x00mock-vp8",
             }
 
         manifest_files = {}
@@ -437,7 +514,9 @@ class WebClientManifestHardeningTests(SimpleTestCase):
             }
 
         if include_manifest:
-            lines = [f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}" for k in sorted(manifest_files.keys())]
+            lines = [
+                f"{k}:{manifest_files[k]['size']}:{manifest_files[k]['sha256']}" for k in sorted(manifest_files.keys())
+            ]
             root_digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
             build_manifest = {
                 "schema_version": 1,
@@ -449,7 +528,9 @@ class WebClientManifestHardeningTests(SimpleTestCase):
             }
             if manifest_override:
                 build_manifest.update(manifest_override)
-            (src_path / "build_manifest.json").write_text(json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            (src_path / "build_manifest.json").write_text(
+                json.dumps(build_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
 
         return src_path
 
@@ -463,7 +544,7 @@ class WebClientManifestHardeningTests(SimpleTestCase):
     def test_tampered_file_size_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = self._create_mock_source(tmp)
-            (src / "main.dart.js").write_bytes(b'tampered-short')
+            (src / "main.dart.js").write_bytes(b"tampered-short")
             res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("Size mismatch for main.dart.js", res.stderr)
@@ -471,8 +552,8 @@ class WebClientManifestHardeningTests(SimpleTestCase):
     def test_tampered_file_hash_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = self._create_mock_source(tmp)
-            original_len = len(b'// dart2js code\n')
-            (src / "main.dart.js").write_bytes(b'x' * original_len)
+            original_len = len(b"// dart2js code\n")
+            (src / "main.dart.js").write_bytes(b"x" * original_len)
             res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("Hash mismatch for main.dart.js", res.stderr)
@@ -480,7 +561,7 @@ class WebClientManifestHardeningTests(SimpleTestCase):
     def test_unmanifested_extra_file_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = self._create_mock_source(tmp)
-            (src / "unexpected_file.txt").write_bytes(b'unmanifested')
+            (src / "unexpected_file.txt").write_bytes(b"unmanifested")
             res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("Unmanifested file found in web client source: unexpected_file.txt", res.stderr)
@@ -498,4 +579,3 @@ class WebClientManifestHardeningTests(SimpleTestCase):
             res = subprocess.run(["bash", str(self.sync_script), "--source", str(src)], capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("build_manifest source_revision mismatch", res.stderr)
-
