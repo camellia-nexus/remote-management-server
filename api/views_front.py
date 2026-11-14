@@ -22,6 +22,7 @@ from django.forms.models import model_to_dict
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.translation import gettext as _
 
 from api.address_book_authorization import (
@@ -244,10 +245,44 @@ def user_action(request):
     return JsonResponse({"error": _("未知操作。")}, status=404)
 
 
+def get_safe_redirect_url(request, next_url: str | None, default: str = "/api/home") -> str:
+    """Validate and sanitize next redirect URL to prevent open redirect vulnerabilities (NAV-002).
+
+    Rejects:
+    - Non-string or empty inputs
+    - URLs containing backslashes (\\) which browsers normalize to forward slashes (/)
+    - URLs containing ASCII control characters or whitespace (<= 32 or 127)
+    - URLs not starting with '/' or starting with '//' (scheme-relative)
+    - External domains / URLs with unapproved hosts/schemes
+    """
+    if not next_url or not isinstance(next_url, str):
+        return default
+
+    stripped = next_url.strip()
+    if not stripped or stripped != next_url:
+        return default
+
+    if "\\" in next_url:
+        return default
+
+    if any(ord(c) <= 32 or ord(c) == 127 for c in next_url):
+        return default
+
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        return default
+
+    allowed_hosts = {request.get_host()} if hasattr(request, "get_host") else set()
+    if not url_has_allowed_host_and_scheme(next_url, allowed_hosts=allowed_hosts, require_https=False):
+        return default
+
+    return next_url
+
+
 def user_login(request):
     if request.method == "GET":
         _log_event(request, "front_login_view", level="debug")
-        return render(request, "login.html")
+        next_url = get_safe_redirect_url(request, request.GET.get("next"), default="")
+        return render(request, "login.html", {"next_url": next_url})
     if request.method != "POST":
         return JsonResponse({"code": 0, "msg": _("请求方式错误。")}, status=405)
 
@@ -278,7 +313,9 @@ def user_login(request):
         auth.login(request, user)
         complete_login_success(admission)
         _log_event(request, "front_login_success", username=username)
-        return JsonResponse({"code": 1, "url": "/api/home"})
+        next_candidate = request.POST.get("next") or request.GET.get("next") or ""
+        safe_url = get_safe_redirect_url(request, next_candidate, default="/api/home")
+        return JsonResponse({"code": 1, "url": safe_url})
     return JsonResponse({"code": 0, "msg": _("帐号或密码错误！")})
 
 

@@ -37,7 +37,7 @@
       <div id="form-message" class="form-message" role="alert" tabindex="-1"></div>
       <form id="login-form" action="/api/user_action?action=login" method="post">
         {% csrf_token %}
-        <input type="hidden" name="next" id="next-url">
+        <input type="hidden" name="next" id="next-url" value="{{ next_url | default:'' | escape }}">
         <div class="form-field">
           <label for="account">{{ "用户名" | translate }}</label>
           <input id="account" type="text" name="account" autocomplete="username" required placeholder="{{ "请输入用户名" | translate }}">
@@ -82,10 +82,17 @@
     const isSafeNext = (value) => {
       if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return false;
       if (Array.from(value).some((char) => char.charCodeAt(0) <= 32 || [92, 127].includes(char.charCodeAt(0)))) return false;
-      return new URL(value, window.location.origin).origin === window.location.origin;
+      try {
+        const parsed = new URL(value, window.location.origin);
+        return parsed.origin === window.location.origin;
+      } catch (e) {
+        return false;
+      }
     };
     if (nextParam && isSafeNext(nextParam)) {
       nextField.value = nextParam;
+    } else if (!isSafeNext(nextField.value)) {
+      nextField.value = '';
     }
     if (registered === '1') {
       showMessage('{{ "注册成功，请使用新账号登录。" | translate | escapejs }}');
@@ -114,8 +121,7 @@
           body: formData,
         });
         if (data.code === 1 && isSafeNext(data.url)) {
-          const target = nextField.value && isSafeNext(nextField.value) ? nextField.value : data.url;
-          window.location.href = target;
+          window.location.href = data.url;
         } else {
           throw new window.camelliaHttp.HttpFailure('protocol');
         }
