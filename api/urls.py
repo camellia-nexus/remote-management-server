@@ -1,3 +1,5 @@
+import functools
+
 from django.urls import re_path as url
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -15,9 +17,16 @@ from api.response_security import credential_response, sensitive_response
 
 def stateless_api(view, *methods):
     """Declare the method contract for APIs that never authenticate by cookie."""
-    wrapped = csrf_exempt(require_http_methods(methods)(view))
+
+    @functools.wraps(view)
+    def wrapper(request, *args, **kwargs):
+        request.is_stateless_api = True
+        return view(request, *args, **kwargs)
+
+    wrapped = csrf_exempt(require_http_methods(methods)(wrapper))
     setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_JSON)
     return wrapped
+
 
 
 def browser_view(view, *methods):

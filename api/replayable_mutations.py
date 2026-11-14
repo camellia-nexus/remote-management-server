@@ -156,6 +156,7 @@ def replayable_stateless_api(view, operation, *methods):
     """Persist mutation results and serialize writes against profile generations."""
 
     def wrapped(request, *args, **kwargs):
+        request.is_stateless_api = True
         if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
             return view(request, *args, **kwargs)
         try:

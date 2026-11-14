@@ -119,6 +119,7 @@ from api.oidc_documents import (
     validate_oidc_jwks,
     validated_signing_algorithms,
 )
+from api.plugin_signing_policy import check_plugin_signing_key_policy
 from api.policy_generation import (
     InvalidManagedPolicy,
     device_ids_affected_by_groups,
@@ -170,6 +171,121 @@ MAX_API_PAGE_OFFSET = 10_000
 OIDC_DOCUMENT_CACHE_MAX_ENTRIES = 16
 OIDC_DOCUMENT_CACHE_TTL_SECONDS = 300
 OIDC_DOCUMENT_CACHE_STALE_SECONDS = 900
+MAX_AUDIT_INFO_DEPTH = 4
+MAX_AUDIT_INFO_KEYS = 32
+MAX_AUDIT_INFO_ITEMS = 64
+MAX_AUDIT_INFO_STR_LEN = MAX_AUDIT_INFO_BYTES
+
+FILE_AUDIT_ALLOWED_KEYS = frozenset({
+    "version",
+    "receipt_version",
+    "audit_session_id",
+    "event_id",
+    "reporter_sequence",
+    "transfer_id",
+    "transfer_revision",
+    "conn_id",
+    "is_file",
+    "state",
+    "path",
+    "peer_id",
+    "direction",
+    "planned_file_count",
+    "planned_bytes",
+    "transferred_bytes",
+    "source_kind",
+    "terminal_reason",
+    "sample_files",
+    "id",
+    "uuid",
+})
+
+ALARM_AUDIT_ALLOWED_KEYS = frozenset({
+    "version",
+    "receipt_version",
+    "audit_session_id",
+    "event_id",
+    "reporter_sequence",
+    "conn_id",
+    "typ",
+    "info",
+    "conn_audit_ref",
+    "id",
+    "uuid",
+})
+
+
+def _validate_bounded_json_value(val, depth=0, total_nodes=None):
+    if total_nodes is None:
+        total_nodes = [0]
+    total_nodes[0] += 1
+    if total_nodes[0] > 128:
+        raise ValueError("Audit info contains too many total nodes")
+    if depth > MAX_AUDIT_INFO_DEPTH:
+        raise ValueError("Audit info nesting depth exceeded")
+
+    if val is None or isinstance(val, (bool, int, float)):
+        return val
+    elif isinstance(val, str):
+        if len(val.encode("utf-8")) > MAX_AUDIT_INFO_STR_LEN:
+            raise ValueError("Audit info string field exceeds maximum length")
+        return val
+    elif isinstance(val, list):
+        if len(val) > MAX_AUDIT_INFO_ITEMS:
+            raise ValueError("Audit info array exceeds maximum item count")
+        return [_validate_bounded_json_value(item, depth + 1, total_nodes) for item in val]
+    elif isinstance(val, dict):
+        if len(val) > MAX_AUDIT_INFO_KEYS:
+            raise ValueError("Audit info object exceeds maximum key count")
+        out = {}
+        for k, v in val.items():
+            if not isinstance(k, str) or len(k.encode("utf-8")) > 128:
+                raise ValueError("Invalid audit info key")
+            out[k] = _validate_bounded_json_value(v, depth + 1, total_nodes)
+        return out
+    else:
+        raise ValueError(f"Invalid audit info value type: {type(val).__name__}")
+
+
+def _validate_and_canonicalize_audit_info(raw_info, max_bytes=MAX_AUDIT_INFO_BYTES):
+    """
+    Validate and canonically bound audit info.
+
+    Returns (cleaned_dict, error_response).
+    Enforces identical 16KiB limit and structural bounds whether raw_info was string or dict.
+    """
+    if not isinstance(raw_info, (str, dict)):
+        return None, JsonResponse({"error": "Invalid alarm information"}, status=400)
+
+    if isinstance(raw_info, str):
+        raw_bytes = raw_info.encode("utf-8")
+        if len(raw_bytes) > max_bytes:
+            return None, JsonResponse({"error": "Alarm information is too large"}, status=413)
+        try:
+            parsed = load_json_text(raw_info, max_bytes=max_bytes)
+        except (json.JSONDecodeError, InvalidJsonPayload, ValueError):
+            return None, JsonResponse({"error": "Invalid alarm information"}, status=400)
+    else:
+        parsed = raw_info
+
+    if not isinstance(parsed, dict):
+        return None, JsonResponse({"error": "Invalid alarm information"}, status=400)
+
+    try:
+        canonical_bytes = json.dumps(parsed, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError):
+        return None, JsonResponse({"error": "Invalid alarm information"}, status=400)
+
+    if len(canonical_bytes) > max_bytes:
+        return None, JsonResponse({"error": "Alarm information is too large"}, status=413)
+
+    try:
+        bounded = _validate_bounded_json_value(parsed)
+    except ValueError:
+        return None, JsonResponse({"error": "Invalid alarm information"}, status=400)
+
+    return bounded, None
+
 
 
 @dataclass(frozen=True)
@@ -1078,16 +1194,32 @@ def get_client_ip(request):
 
 
 def _log_event(request, event, level="info", **extra):
+    is_stateless = getattr(request, "is_stateless_api", False)
     user = getattr(request, "user", None)
-    username = (
-        user.username if user and getattr(user, "is_authenticated", False) else extra.pop("username", "anonymous")
+    ambient_user = (
+        user.username if user and getattr(user, "is_authenticated", False) else None
     )
-    attributes = {
-        "user": username,
-        "ip": get_client_ip(request),
-    }
+    if is_stateless:
+        username = extra.pop("username", None) or extra.pop("actor", None) or "anonymous"
+        attributes = {
+            "user": username,
+            "ip": get_client_ip(request),
+        }
+        if ambient_user and ambient_user != username:
+            attributes["ambient_session_user"] = ambient_user
+    else:
+        username = (
+            ambient_user
+            if ambient_user
+            else extra.pop("username", None) or extra.pop("actor", None) or "anonymous"
+        )
+        attributes = {
+            "user": username,
+            "ip": get_client_ip(request),
+        }
     attributes.update({k: v for k, v in extra.items() if v is not None})
     log_structured_event(logger, request, event, level=level, attributes=attributes)
+
 
 
 _record_file_lock = recording_uploads._record_file_lock
@@ -2137,6 +2269,7 @@ def health_ready(request):
         check_release_schema()
         check_runtime_write_capability()
         check_username_identity(full=False)
+        check_plugin_signing_key_policy()
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
         key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])
         primary_key_id = getattr(settings, "DATA_ENCRYPTION_PRIMARY_KEY_ID", "")
@@ -5286,6 +5419,8 @@ def _audit_file(request):
         return _audit_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
     if not _audit_evidence_receipt_version_is_current(postdata.get("receipt_version")):
         return _audit_evidence_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
+    if set(postdata.keys()) - FILE_AUDIT_ALLOWED_KEYS:
+        return JsonResponse({"error": "Invalid file audit"}, status=400)
     audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
     event_id = _audit_uuid4(postdata.get("event_id"))
     reporter_sequence = _audit_reporter_sequence(postdata.get("reporter_sequence"))
@@ -5589,14 +5724,11 @@ def _audit_alarm(request):
     typ = _audit_enum(postdata.get("typ", 0), AlarmLog.TYPES)
     if typ is None:
         return JsonResponse({"error": "Invalid alarm type"}, status=400)
-    raw_info = postdata.get("info", "{}")
-    if not isinstance(raw_info, (str, dict)):
-        return JsonResponse({"error": "Invalid alarm information"}, status=400)
-    if isinstance(raw_info, str) and len(raw_info.encode()) > MAX_AUDIT_INFO_BYTES:
-        return JsonResponse({"error": "Alarm information is too large"}, status=413)
-    info = load_json_text(raw_info, max_bytes=MAX_AUDIT_INFO_BYTES) if isinstance(raw_info, str) else raw_info
-    if not isinstance(info, dict):
-        return JsonResponse({"error": "Invalid alarm information"}, status=400)
+    if set(postdata.keys()) - ALARM_AUDIT_ALLOWED_KEYS:
+        return JsonResponse({"error": "Invalid alarm audit"}, status=400)
+    info, error = _validate_and_canonicalize_audit_info(postdata.get("info", "{}"))
+    if error:
+        return error
     audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref", ""), 256)
     if audit_ref is None:
         return JsonResponse({"error": "Invalid audit reference"}, status=400)
