@@ -16,6 +16,7 @@ dependencies = [
   "pynacl>=1.6,<2",
   "psycopg[binary]>=3.3,<4",
   "unicodedata2==16.0.0; python_version != '3.14'",
+  "brotli>=1.1.0",
 ]
 
 [dependency-groups]

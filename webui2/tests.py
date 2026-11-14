@@ -7,10 +7,13 @@ import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
+import brotli
 from django.conf import settings
 from django.contrib.staticfiles import finders
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.core.management import call_command
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 from django.utils.csp import CSP
+from whitenoise.middleware import WhiteNoiseMiddleware
 
 from api.models import UserProfile
 from webui2.views import (
@@ -238,6 +241,8 @@ class WebClientRuntimeTests(TestCase):
                     "manifest.json": b'{"name":"Camellia"}\n',
                     "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
                     "canvaskit/canvaskit.wasm": b"\x00asm\x01\x00\x00\x00mock-canvaskit",
+                    "favicon.svg": b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+                    "bootstrap.js": b"// bootstrap mock\n",
                     "js/dist/web_bridge.js": b"// web bridge mock\n",
                     "js/dist/assets/video_worker-mock.js": b"// worker mock\n",
                     "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b"// vp8 mock\n",
@@ -475,6 +480,49 @@ class WebClientRuntimeTests(TestCase):
             all(source != CSP.UNSAFE_INLINE and source != "'unsafe-inline'" for source in script_src_policy)
         )
 
+    def test_whitenoise_serves_brotli_compression_when_requested(self):
+        """
+        Verify that WhiteNoise generates and serves Brotli pre-compression (Content-Encoding: br)
+        when requested with Accept-Encoding: br (PERF-006).
+        """
+        self.assertTrue(hasattr(brotli, "compress"))
+        with tempfile.TemporaryDirectory() as tmp_root:
+            with override_settings(
+                STATIC_ROOT=Path(tmp_root),
+                WHITENOISE_AUTOREFRESH=False,
+                WHITENOISE_USE_FINDERS=False,
+            ):
+                call_command("collectstatic", interactive=False, verbosity=0)
+
+                # Assert that .br compressed assets exist in collected static files
+                br_assets = list(Path(tmp_root).rglob("*.br"))
+                self.assertGreater(len(br_assets), 0, "Expected .br files generated during collectstatic")
+
+                middleware = WhiteNoiseMiddleware(get_response=lambda r: None)
+                rf = RequestFactory()
+
+                # Request with Accept-Encoding: br
+                request_br = rf.get("/static/webui2/app.css", HTTP_ACCEPT_ENCODING="br")
+                response_br = middleware(request_br)
+                self.assertIsNotNone(response_br)
+                self.assertEqual(response_br.status_code, 200)
+                self.assertEqual(response_br.headers.get("Content-Encoding"), "br")
+                self.assertIn("Accept-Encoding", response_br.headers.get("Vary", ""))
+
+                # Request with Accept-Encoding: gzip
+                request_gz = rf.get("/static/webui2/app.css", HTTP_ACCEPT_ENCODING="gzip")
+                response_gz = middleware(request_gz)
+                self.assertIsNotNone(response_gz)
+                self.assertEqual(response_gz.status_code, 200)
+                self.assertEqual(response_gz.headers.get("Content-Encoding"), "gzip")
+
+                # Request without compression
+                request_none = rf.get("/static/webui2/app.css")
+                response_none = middleware(request_none)
+                self.assertIsNotNone(response_none)
+                self.assertEqual(response_none.status_code, 200)
+                self.assertIsNone(response_none.headers.get("Content-Encoding"))
+
 
 class WebClientManifestHardeningTests(SimpleTestCase):
     def setUp(self):
@@ -497,6 +545,8 @@ class WebClientManifestHardeningTests(SimpleTestCase):
                 "manifest.json": b'{"name":"Camellia"}\n',
                 "index.html": b'<!DOCTYPE html><html><head><base href="/"><script src="js/dist/web_bridge.js"></script></head><body></body></html>\n',
                 "canvaskit/canvaskit.wasm": b"\x00asm\x01\x00\x00\x00mock-canvaskit",
+                "favicon.svg": b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+                "bootstrap.js": b"// bootstrap mock\n",
                 "js/dist/web_bridge.js": b"// web bridge mock\n",
                 "js/dist/assets/video_worker-mock.js": b"// worker mock\n",
                 "ogvjs-1.8.6/ogv-decoder-video-vp8-wasm.js": b"// vp8 mock\n",
