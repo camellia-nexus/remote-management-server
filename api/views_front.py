@@ -286,6 +286,10 @@ def user_login(request):
     if request.method != "POST":
         return JsonResponse({"code": 0, "msg": _("请求方式错误。")}, status=405)
 
+    if getattr(settings, "CAMELLIA_REMOTE_AUTH_OIDC_ONLY", False):
+        _log_event(request, "front_login_oidc_only_rejected", level="warning")
+        return JsonResponse({"code": 0, "msg": _("系统已启用仅OIDC登录模式，密码登录已被禁用。")}, status=403)
+
     try:
         username = normalize_username(request.POST.get("account", ""))
     except ValueError:
@@ -326,6 +330,10 @@ def user_register(request):
         return render(request, "reg.html")
     if request.method != "POST":
         return JsonResponse({"code": 0, "msg": _("请求方式错误。")}, status=405)
+
+    if getattr(settings, "CAMELLIA_REMOTE_AUTH_OIDC_ONLY", False):
+        _log_event(request, "front_register_oidc_only_rejected", level="warning")
+        return JsonResponse({"code": 0, "msg": _("系统已启用仅OIDC登录模式，本地注册已被禁用。")}, status=403)
     ALLOW_REGISTRATION = settings.ALLOW_REGISTRATION
     result = {"code": 0, "msg": ""}
     if not ALLOW_REGISTRATION:

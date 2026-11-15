@@ -3,6 +3,7 @@ import time
 
 from django.conf import settings
 from django.db import connection
+from django.http import HttpResponseForbidden
 from django.urls import Resolver404, resolve
 
 from api.address_book_errors import AuthorizationGenerationExhausted
@@ -252,6 +253,39 @@ class ApiExceptionMiddleware:
             )
             return json_error("internal_server_error", "Internal server error", status=500)
         return None
+
+
+class AuthenticationPolicyMiddleware:
+    """Enforce central authentication policies including OIDC-only mode."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if getattr(settings, "CAMELLIA_REMOTE_AUTH_OIDC_ONLY", False):
+            path = (request.path_info or request.path or "").rstrip("/")
+            if request.method == "POST":
+                if path.endswith("/admin/login"):
+                    log_structured_event(
+                        logger,
+                        request,
+                        "admin_login_oidc_only_rejected",
+                        level="warning",
+                    )
+                    return HttpResponseForbidden("Password login is disabled when OIDC-only mode is enabled.")
+                try:
+                    match = resolve(request.path_info or request.path)
+                    if match and match.url_name == "login" and match.app_name == "admin":
+                        log_structured_event(
+                            logger,
+                            request,
+                            "admin_login_oidc_only_rejected",
+                            level="warning",
+                        )
+                        return HttpResponseForbidden("Password login is disabled when OIDC-only mode is enabled.")
+                except Resolver404:
+                    pass
+        return self.get_response(request)
 
 
 def database_timeout_response(request, timeout_kind):

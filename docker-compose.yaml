@@ -1,5 +1,13 @@
 name: camellia-remote-management
 
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+    mode: "non-blocking"
+    max-buffer-size: "4m"
+
 x-application: &application
   image: ${CAMELLIA_REMOTE_MANAGEMENT_IMAGE:?Pin the released image by sha256 digest}
   # Production keeps the default always policy. CI may set `never` only for
@@ -147,6 +155,7 @@ x-application: &application
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=128m,mode=1777
+  logging: *default-logging
   networks:
     - backend
 
@@ -162,6 +171,7 @@ x-database-client: &database-client
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=32m,mode=1777
+  logging: *default-logging
   networks:
     - backend
   restart: "no"
@@ -197,6 +207,7 @@ services:
       - /tmp:size=16m,mode=1777
     volumes:
       - postgres-data:/var/lib/postgresql
+    logging: *default-logging
     network_mode: none
     restart: "no"
     cpus: "0.25"
@@ -238,6 +249,7 @@ services:
       CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD:?Set the probe password}
     volumes:
       - postgres-data:/var/lib/postgresql
+    logging: *default-logging
     # Normal steady state is PostgreSQL + management (3 CPUs/3 GiB). The
     # controller stops management before migration; backup is separately
     # capped and never runs concurrently with migration.

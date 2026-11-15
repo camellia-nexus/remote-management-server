@@ -414,6 +414,15 @@ if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
         "CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN is required when CAMELLIA_REMOTE_DEBUG is false"
     )
 
+# Authentication Policy: OIDC-only and MFA Enforcement (AUTH-014)
+CAMELLIA_REMOTE_AUTH_OIDC_ONLY = env_bool("CAMELLIA_REMOTE_AUTH_OIDC_ONLY", False)
+CAMELLIA_REMOTE_AUTH_ENFORCE_MFA = env_bool("CAMELLIA_REMOTE_AUTH_ENFORCE_MFA", False)
+CAMELLIA_REMOTE_OIDC_REQUIRE_MFA = env_bool("CAMELLIA_REMOTE_OIDC_REQUIRE_MFA", False)
+_oidc_required_acr = os.environ.get("CAMELLIA_REMOTE_OIDC_REQUIRED_ACR_VALUES", "").strip()
+OIDC_REQUIRED_ACR_VALUES = tuple(
+    dict.fromkeys(item.strip() for item in _oidc_required_acr.split(",") if item.strip())
+)
+
 OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
 REQUEST_DEADLINE_SECONDS = env_int(
@@ -468,6 +477,8 @@ if not _oidc_auto_provision and (_oidc_auto_provision_email_domains or _oidc_aut
     raise ImproperlyConfigured("OIDC auto-provision policy cannot be configured while auto-provision is disabled")
 if _oidc_auto_provision and not (_oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims):
     raise ImproperlyConfigured("OIDC auto-provision requires an email-domain or exact-claim policy")
+if CAMELLIA_REMOTE_AUTH_OIDC_ONLY and not all(_oidc_values):
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_AUTH_OIDC_ONLY requires a complete OIDC provider configuration")
 if all(_oidc_values):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _oidc_name):
         raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_NAME contains unsupported characters")
@@ -824,6 +835,7 @@ MIDDLEWARE = [
     "api.middleware.SafeAccessLogMiddleware",
     "api.middleware.DatabaseDeadlineMiddleware",
     "api.middleware.TrustedProxyMiddleware",
+    "api.middleware.AuthenticationPolicyMiddleware",
     "api.rate_limits.IngressRateLimitMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",

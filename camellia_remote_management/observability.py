@@ -53,6 +53,51 @@ _STRUCTURED_REQUIRED_FIELDS = {
     "attributes",
 }
 
+_SECRET_KEYS_RE = re.compile(
+    r"(password|passwd|token|secret|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|sessionid|credential|pin|client[_-]?secret)",
+    re.IGNORECASE,
+)
+_IPV4_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}\b")
+_IPV6_RE = re.compile(r"\b([0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}:)[0-9a-fA-F:]+\b")
+_EMAIL_RE = re.compile(r"\b([a-zA-Z0-9_.+-])[a-zA-Z0-9_.+-]*@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b")
+_CONTROL_CHAR_RE = re.compile(r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def sanitize_log_value(value, *, max_len: int = 1024):
+    """Sanitize a single log attribute value to strip secrets, PII, and control chars."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        cleaned = _CONTROL_CHAR_RE.sub(" ", value)
+        cleaned = _IPV4_RE.sub(r"\g<1>xxx", cleaned)
+        cleaned = _IPV6_RE.sub(r"\g<1>xxxx", cleaned)
+        cleaned = _EMAIL_RE.sub(r"\g<1>***@\g<2>", cleaned)
+        if len(cleaned) > max_len:
+            return cleaned[:max_len] + "...[TRUNCATED]"
+        return cleaned
+    if isinstance(value, dict):
+        return sanitize_log_attributes(value, max_len=max_len)
+    if isinstance(value, (list, tuple)):
+        return [sanitize_log_value(item, max_len=max_len) for item in value]
+    return sanitize_log_value(str(value), max_len=max_len)
+
+
+def sanitize_log_attributes(attributes: dict | None, *, max_len: int = 1024) -> dict:
+    """Sanitize dictionary attributes applying secret denylist and PII/control-char filtering."""
+    if not isinstance(attributes, dict):
+        return {}
+    sanitized = {}
+    for key, value in attributes.items():
+        key_str = str(key)
+        if _SECRET_KEYS_RE.search(key_str):
+            sanitized[key_str] = "[REDACTED]"
+        else:
+            sanitized[key_str] = sanitize_log_value(value, max_len=max_len)
+    return sanitized
+
+
 
 @dataclass(frozen=True, slots=True)
 class RequestContext:
@@ -176,9 +221,33 @@ class StructuredEventFormatter(logging.Formatter):
             and parsed.get("schema_version") == 1
             and parsed.get("service") == SERVICE_NAME
         ):
+            if "attributes" in parsed and isinstance(parsed["attributes"], dict):
+                parsed["attributes"] = sanitize_log_attributes(parsed["attributes"])
             return json.dumps(parsed, ensure_ascii=False, default=str, separators=(",", ":"), sort_keys=True)
 
         context = current_request_context()
+        raw_attributes = {
+            "logger": record.name,
+            "message": message,
+        }
+        if record.exc_info and record.exc_info[0]:
+            error_class = record.exc_info[0].__name__
+            frames = []
+            traceback = record.exc_info[2]
+            while traceback is not None and len(frames) < 32:
+                frame = traceback.tb_frame
+                frames.append(
+                    {
+                        "module": frame.f_globals.get("__name__", "<unknown>"),
+                        "function": frame.f_code.co_name,
+                        "line": traceback.tb_lineno,
+                    }
+                )
+                traceback = traceback.tb_next
+            raw_attributes["stack_frames"] = frames
+        else:
+            error_class = None
+
         payload = {
             "schema_version": 1,
             "timestamp": datetime.fromtimestamp(record.created, UTC)
@@ -193,28 +262,12 @@ class StructuredEventFormatter(logging.Formatter):
             "span_id": context.span_id if context else None,
             "route": context.route if context else "<background>",
             "method": context.method if context else "BACKGROUND",
-            "attributes": {
-                "logger": record.name,
-                "message": message,
-            },
+            "attributes": sanitize_log_attributes(raw_attributes),
         }
         if context and context.event_id:
             payload["event_id"] = context.event_id
-        if record.exc_info and record.exc_info[0]:
-            payload["error_class"] = record.exc_info[0].__name__
-            frames = []
-            traceback = record.exc_info[2]
-            while traceback is not None and len(frames) < 32:
-                frame = traceback.tb_frame
-                frames.append(
-                    {
-                        "module": frame.f_globals.get("__name__", "<unknown>"),
-                        "function": frame.f_code.co_name,
-                        "line": traceback.tb_lineno,
-                    }
-                )
-                traceback = traceback.tb_next
-            payload["attributes"]["stack_frames"] = frames
+        if error_class:
+            payload["error_class"] = error_class
         return json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"), sort_keys=True)
 
 
@@ -253,10 +306,11 @@ def log_structured_event(logger, request, event, *, level="info", attributes=Non
         "span_id": context.span_id,
         "route": context.route,
         "method": context.method,
-        "attributes": attributes or {},
+        "attributes": sanitize_log_attributes(attributes or {}),
     }
     if context.event_id:
         payload["event_id"] = context.event_id
-    payload.update({key: value for key, value in fields.items() if value is not None})
+    sanitized_fields = sanitize_log_attributes(fields)
+    payload.update({key: value for key, value in sanitized_fields.items() if value is not None})
     log_fn = getattr(logger, level if level in _LOG_LEVELS else "info")
     log_fn(json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"), sort_keys=True))

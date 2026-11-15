@@ -1048,6 +1048,30 @@ def _validate_oidc_id_token(token, metadata, provider, nonce):
         raise ValueError("OIDC ID token has an invalid authorized party")
     if azp and azp != provider["client_id"]:
         raise ValueError("OIDC ID token has an invalid authorized party")
+
+    if getattr(settings, "OIDC_REQUIRED_ACR_VALUES", ()):
+        token_acr = str(claims.get("acr") or "").strip()
+        if token_acr not in settings.OIDC_REQUIRED_ACR_VALUES:
+            raise ValueError(f"OIDC ID token acr '{token_acr}' does not satisfy required ACR policy")
+
+    if getattr(settings, "CAMELLIA_REMOTE_OIDC_REQUIRE_MFA", False):
+        amr = claims.get("amr")
+        amr_list = [str(x).lower().strip() for x in amr] if isinstance(amr, (list, tuple)) else []
+        acr = str(claims.get("acr") or "").lower().strip()
+        mfa_amr_indicators = {"mfa", "otp", "totp", "sms", "fido", "fido2", "hwk", "smartcard", "webauthn"}
+        has_mfa = (
+            bool(set(amr_list) & mfa_amr_indicators)
+            or len(set(amr_list) - {"pwd", "password"}) >= 2
+            or "mfa" in acr
+            or "aal2" in acr
+            or "aal3" in acr
+            or "loa3" in acr
+            or "loa4" in acr
+            or "multipleauthn" in acr
+        )
+        if not has_mfa:
+            raise ValueError("OIDC ID token does not satisfy required MFA policy")
+
     return claims
 
 
@@ -2011,6 +2035,9 @@ def _finalize_personal_device_peer(user, device):
 
 
 def login(request):
+    if getattr(settings, "CAMELLIA_REMOTE_AUTH_OIDC_ONLY", False):
+        _log_event(request, "api_login_oidc_only_rejected", level="warning")
+        return JsonResponse({"error": _("系统已启用仅OIDC登录模式，密码登录已被禁用。")}, status=403)
     result = {}
     data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
 
