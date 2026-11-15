@@ -5,10 +5,12 @@ import uuid
 
 from api.operation_intents import (
     SecretIntent,
+    canonical_document,
     new_private_binding,
     partition_intent,
     private_binding_matches,
     public_intent_digest,
+    serialize_canonical_json,
 )
 
 
@@ -87,3 +89,80 @@ class OperationIntentPrivacyTests(unittest.TestCase):
         self.assertNotIn("SYNTHETIC-DEEP-INTENT", json.dumps(public))
         binding = new_private_binding(document, **self.context)
         self.assertTrue(private_binding_matches(binding, document, **self.context))
+
+
+class CanonicalJsonSerializationTests(unittest.TestCase):
+    def test_negative_zero_normalizes_to_zero(self):
+        self.assertEqual(serialize_canonical_json(-0.0), "0")
+        self.assertEqual(serialize_canonical_json(0.0), "0")
+        self.assertEqual(serialize_canonical_json(0), "0")
+        self.assertEqual(canonical_document({"zero": -0.0}), b'{"zero":0}')
+        self.assertEqual(canonical_document([-0.0, 0.0, 0]), b"[0,0,0]")
+
+    def test_integer_float_normalizes_to_integer(self):
+        self.assertEqual(serialize_canonical_json(1.0), "1")
+        self.assertEqual(serialize_canonical_json(-1.0), "-1")
+        self.assertEqual(serialize_canonical_json(42.0), "42")
+        self.assertEqual(serialize_canonical_json(9007199254740991.0), "9007199254740991")
+        self.assertEqual(serialize_canonical_json(-9007199254740991.0), "-9007199254740991")
+        self.assertEqual(canonical_document({"value": 1.0}), b'{"value":1}')
+
+    def test_exponents_serialize_without_zero_padding(self):
+        self.assertEqual(serialize_canonical_json(1e-7), "1e-7")
+        self.assertEqual(serialize_canonical_json(-1e-7), "-1e-7")
+        self.assertEqual(serialize_canonical_json(1e-5), "1e-5")
+        self.assertEqual(serialize_canonical_json(2.5e-9), "2.5e-9")
+        self.assertEqual(canonical_document({"rate": 1e-7}), b'{"rate":1e-7}')
+
+    def test_non_finite_floats_raise_value_error(self):
+        for non_finite in [float("nan"), float("inf"), float("-inf")]:
+            with self.subTest(non_finite=str(non_finite)):
+                with self.assertRaisesRegex(ValueError, "Non-finite float not permitted in canonical JSON"):
+                    serialize_canonical_json(non_finite)
+                with self.assertRaises(ValueError):
+                    canonical_document({"bad": non_finite})
+                with self.assertRaises(ValueError):
+                    canonical_document([non_finite])
+
+    def test_utf8_strings_and_sorted_dictionary_keys_serialize_deterministically(self):
+        obj1 = {"b": "hello", "a": "world", "c": "你好"}
+        obj2 = {"c": "你好", "b": "hello", "a": "world"}
+        self.assertEqual(serialize_canonical_json(obj1), '{"a":"world","b":"hello","c":"你好"}')
+        self.assertEqual(serialize_canonical_json(obj1), serialize_canonical_json(obj2))
+        self.assertEqual(
+            canonical_document(obj1),
+            '{"a":"world","b":"hello","c":"你好"}'.encode(),
+        )
+        # Test UTF-16 code unit ordering vs UTF-32 code point ordering
+        # \U0001f600 (surrogate pair high surrogate 0xD83D) sorts before \uffff (0xFFFF) in UTF-16
+        utf16_keys = {"\uffff": "bmp_max", "\U0001f600": "supplementary"}
+        self.assertEqual(
+            serialize_canonical_json(utf16_keys),
+            '{"\U0001f600":"supplementary","\uffff":"bmp_max"}',
+        )
+
+    def test_primitive_and_nested_structures(self):
+        self.assertEqual(serialize_canonical_json(None), "null")
+        self.assertEqual(serialize_canonical_json(True), "true")
+        self.assertEqual(serialize_canonical_json(False), "false")
+        self.assertEqual(serialize_canonical_json([]), "[]")
+        self.assertEqual(serialize_canonical_json({}), "{}")
+        nested = {
+            "null": None,
+            "bool": True,
+            "list": [1, 2.0, -0.0, 1e-7, "item"],
+            "dict": {"sub": "val"},
+        }
+        expected = '{"bool":true,"dict":{"sub":"val"},"list":[1,2,0,1e-7,"item"],"null":null}'
+        self.assertEqual(serialize_canonical_json(nested), expected)
+        self.assertEqual(canonical_document(nested), expected.encode())
+
+    def test_invalid_types_and_keys_fail_closed(self):
+        with self.assertRaises(TypeError):
+            serialize_canonical_json({1: "invalid_key"})
+        with self.assertRaises(ValueError):
+            canonical_document({1: "invalid_key"})
+        with self.assertRaises(ValueError):
+            serialize_canonical_json({1, 2, 3})
+        with self.assertRaises(ValueError):
+            canonical_document({"set": {1, 2, 3}})
