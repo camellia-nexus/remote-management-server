@@ -3457,10 +3457,18 @@ def ab_shared_update_profile(request):
                 AddressBookShare.objects.filter(profile=locked_profile, user=new_owner).delete()
                 owner_changed = True
                 changed = True
-            if changed:
-                if not owner_changed:
-                    bump_locked_authorization_generation(locked_profile)
-            locked_profile.save()
+            try:
+                if changed:
+                    if not owner_changed:
+                        bump_locked_authorization_generation(locked_profile)
+                locked_profile.save()
+            except IntegrityError:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Owner already has an address book with this name"},
+                    applied={"profiles": 0},
+                    result_state={"error": "name_conflict"},
+                )
             body = {
                 "code": 1,
                 "data": "ok",
@@ -4271,16 +4279,35 @@ def ab_tag_rename(request, guid):
         )
         if not old_tag:
             return JsonResponse({"error": "Tag not found"}, status=404)
-        target = RemoteTag.objects.filter(
-            profile=profile,
-            tag_name=new,
-        ).first()
+        target = (
+            RemoteTag.objects.select_for_update()
+            .filter(
+                profile=profile,
+                tag_name=new,
+            )
+            .first()
+        )
         if target and target.pk != old_tag.pk:
             target.peers.add(*old_tag.peers.all())
             old_tag.delete()
         else:
             old_tag.tag_name = new
-            old_tag.save(update_fields=["tag_name"])
+            try:
+                old_tag.save(update_fields=["tag_name"])
+            except IntegrityError:
+                target = (
+                    RemoteTag.objects.select_for_update()
+                    .filter(
+                        profile=profile,
+                        tag_name=new,
+                    )
+                    .first()
+                )
+                if target and target.pk != old_tag.pk:
+                    target.peers.add(*old_tag.peers.all())
+                    old_tag.delete()
+                else:
+                    return JsonResponse({"error": "Tag name conflict"}, status=409)
     _log_event(request, "api_ab_tag_rename", username=user.username, guid=guid, old=old, new=new)
     return empty_success()
 

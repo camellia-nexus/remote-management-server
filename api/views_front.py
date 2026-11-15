@@ -1725,11 +1725,21 @@ def ab_manage(request):
                     if existing_share and existing_share.rule == 3:
                         messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
                         return HttpResponseRedirect("/api/ab_manage")
-                share, created = AddressBookShare.objects.update_or_create(
-                    profile=profile,
-                    user=target,
-                    defaults={"rule": rule_value},
-                )
+                try:
+                    share, created = AddressBookShare.objects.update_or_create(
+                        profile=profile,
+                        user=target,
+                        defaults={"rule": rule_value},
+                    )
+                except IntegrityError:
+                    share = AddressBookShare.objects.select_for_update().filter(profile=profile, user=target).first()
+                    if share:
+                        share.rule = rule_value
+                        share.save(update_fields=("rule",))
+                        created = False
+                    else:
+                        messages.error(request, _("操作冲突，请重试。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 bump_locked_authorization_generation(profile)
                 action_name = "share_add" if created else "share_update"
                 _audit_share(profile, u, action_name, share, {"created": created})
@@ -1756,15 +1766,25 @@ def ab_manage(request):
                     if existing_rule and existing_rule.rule == 3:
                         messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
                         return HttpResponseRedirect("/api/ab_manage")
-                rule_obj, created = AddressBookRule.objects.update_or_create(
-                    profile=profile,
-                    group=group,
-                    defaults={
-                        "user": None,
-                        "rule": rule_value,
-                        "is_everyone": False,
-                    },
-                )
+                try:
+                    rule_obj, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        group=group,
+                        defaults={
+                            "user": None,
+                            "rule": rule_value,
+                            "is_everyone": False,
+                        },
+                    )
+                except IntegrityError:
+                    rule_obj = AddressBookRule.objects.select_for_update().filter(profile=profile, group=group).first()
+                    if rule_obj:
+                        rule_obj.rule = rule_value
+                        rule_obj.save(update_fields=("rule",))
+                        created = False
+                    else:
+                        messages.error(request, _("操作冲突，请重试。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 bump_locked_authorization_generation(profile)
                 action_name = "rule_add" if created else "rule_update"
                 _audit_rule(profile, u, action_name, rule_obj, {"created": created})
@@ -1783,15 +1803,29 @@ def ab_manage(request):
                     if existing_everyone and existing_everyone.rule == 3:
                         messages.error(request, _("仅拥有者或管理员可以修改完全控制权限。"))
                         return HttpResponseRedirect("/api/ab_manage")
-                rule_obj, created = AddressBookRule.objects.update_or_create(
-                    profile=profile,
-                    is_everyone=True,
-                    defaults={
-                        "group": None,
-                        "user": None,
-                        "rule": rule_value,
-                    },
-                )
+                try:
+                    rule_obj, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        is_everyone=True,
+                        defaults={
+                            "group": None,
+                            "user": None,
+                            "rule": rule_value,
+                        },
+                    )
+                except IntegrityError:
+                    rule_obj = (
+                        AddressBookRule.objects.select_for_update()
+                        .filter(profile=profile, is_everyone=True)
+                        .first()
+                    )
+                    if rule_obj:
+                        rule_obj.rule = rule_value
+                        rule_obj.save(update_fields=("rule",))
+                        created = False
+                    else:
+                        messages.error(request, _("操作冲突，请重试。"))
+                        return HttpResponseRedirect("/api/ab_manage")
                 bump_locked_authorization_generation(profile)
                 action_name = "rule_add" if created else "rule_update"
                 _audit_rule(profile, u, action_name, rule_obj, {"created": created})
