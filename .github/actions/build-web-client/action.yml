@@ -63,14 +63,23 @@ runs:
         fi
 
         runs_json="$(
-          gh api -X GET "repos/$REPOSITORY/actions/runs" \
+          gh api -X GET "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
             -f head_sha="$REVISION" \
             -f event=push \
             -f status=success \
+            -f branch="$default_branch" \
             -f per_page=100
         )"
         verified_run=""
         while IFS= read -r run_id; do
+          run_detail="$(
+            gh api -X GET "repos/$REPOSITORY/actions/runs/$run_id"
+          )"
+          run_path="$(jq -r '.path // ""' <<< "$run_detail")"
+          run_branch="$(jq -r '.head_branch // ""' <<< "$run_detail")"
+          if [[ "$run_path" != ".github/workflows/ci.yml" || "$run_branch" != "$default_branch" ]]; then
+            continue
+          fi
           jobs_json="$(
             gh api -X GET "repos/$REPOSITORY/actions/runs/$run_id/jobs" \
               -f per_page=100
@@ -85,10 +94,10 @@ runs:
         done < <(jq -r '.workflow_runs | sort_by(.run_number) | reverse[] | .id' <<< "$runs_json")
 
         if [[ -z "$verified_run" ]]; then
-          echo "Camellia Remote revision $REVISION has no successful push CI / Required check" >&2
+          echo "Camellia Remote revision $REVISION has no successful default-branch push CI / Required check under .github/workflows/ci.yml" >&2
           exit 1
         fi
-        echo "Verified Camellia Remote push CI run $verified_run for $REVISION"
+        echo "Verified Camellia Remote push CI run $verified_run (workflow: .github/workflows/ci.yml, branch: $default_branch) for $REVISION"
 
     - name: Restore compiled Web runtime
       id: runtime-cache
