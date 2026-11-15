@@ -7222,16 +7222,23 @@ def device_group_accessible(request):
     if user.is_admin:
         groups = list(DeviceGroup.objects.select_related("strategy").order_by("name"))
     else:
-        groups = list(
+        user_identities = {user.username} | set(user.groups.values_list("name", flat=True))
+        owned_group_ids = set(
             DeviceGroup.objects.filter(
                 devices__in=RemoteDevice.objects.filter(
                     owner=user,
                 )
-            )
-            .select_related("strategy")
-            .distinct()
-            .order_by("name")
+            ).values_list("pk", flat=True)
         )
+        all_groups = list(DeviceGroup.objects.select_related("strategy").order_by("name"))
+        groups = []
+        for group in all_groups:
+            if group.pk in owned_group_ids:
+                groups.append(group)
+            elif isinstance(group.allowed_incomings, list) and any(
+                item in user_identities for item in group.allowed_incomings
+            ):
+                groups.append(group)
     data = [_serialize_device_group(group) for group in groups]
     _log_event(request, "api_device_group_accessible", level="debug", username=user.username, total=len(data))
     return JsonResponse({"total": len(data), "data": data})
