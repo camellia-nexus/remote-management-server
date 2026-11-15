@@ -10,6 +10,8 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
+import re
 import secrets
 from dataclasses import dataclass
 
@@ -28,12 +30,50 @@ class SecretIntent:
     value: object
 
 
+_MIN_SAFE_INTEGER = -9007199254740991
+_MAX_SAFE_INTEGER = 9007199254740991
+_EXP_ZERO_PAD_RE = re.compile(r"e([+-])0*(\d+)")
+
+
+def serialize_canonical_json(obj):
+    """Serialize an object to a canonical JSON string conforming to RFC 8785."""
+    if obj is None:
+        return "null"
+    if isinstance(obj, bool):
+        return "true" if obj else "false"
+    if isinstance(obj, int):
+        return str(obj)
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError("Non-finite float not permitted in canonical JSON")
+        if obj == 0.0:
+            return "0"
+        if obj.is_integer() and _MIN_SAFE_INTEGER <= int(obj) <= _MAX_SAFE_INTEGER:
+            return str(int(obj))
+        s = repr(obj)
+        return _EXP_ZERO_PAD_RE.sub(r"e\1\2", s)
+    if isinstance(obj, str):
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(obj, (list, tuple)):
+        return "[" + ",".join(serialize_canonical_json(x) for x in obj) + "]"
+    if isinstance(obj, dict):
+        for k in obj:
+            if not isinstance(k, str):
+                raise TypeError("Management operation intent keys must be strings")
+        items = sorted(obj.items(), key=lambda kv: kv[0].encode("utf-16-be"))
+        return "{" + ",".join(
+            json.dumps(k, ensure_ascii=False, separators=(",", ":")) + ":" + serialize_canonical_json(v)
+            for k, v in items
+        ) + "}"
+    raise ValueError(f"Unsupported canonical type: {type(obj)}")
+
+
 def canonical_document(value):
     try:
-        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode(
-            "utf-8"
-        )
-    except (TypeError, ValueError, UnicodeError):
+        return serialize_canonical_json(value).encode()
+    except (TypeError, ValueError, UnicodeError) as err:
+        if isinstance(err, ValueError) and str(err):
+            raise
         raise ValueError("Management operation document is not canonical JSON") from None
 
 
