@@ -89,7 +89,11 @@ if [[ -n "$CLIENT_REPO_INPUT" ]]; then
     exit 1
   fi
 
-  (cd "$CLIENT_REPO" && bash "$BUILD_SCRIPT" --mode release --base-href /static/web_client/)
+  if grep -q -- '--base-href' "$BUILD_SCRIPT"; then
+    (cd "$CLIENT_REPO" && bash "$BUILD_SCRIPT" --mode release --base-href /static/web_client/)
+  else
+    (cd "$CLIENT_REPO" && BASE_HREF="/static/web_client/" bash "$BUILD_SCRIPT" --mode release)
+  fi
 
   if [[ -n "$(git -C "$CLIENT_REPO" status --porcelain --untracked-files=no)" ]]; then
     echo "Client build modified tracked source files; refusing to synchronize ambiguous output." >&2
